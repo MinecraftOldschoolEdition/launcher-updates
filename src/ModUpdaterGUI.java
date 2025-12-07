@@ -1,17 +1,28 @@
+// =============================================================================
+// IMPORTS
+// =============================================================================
+
+// Swing GUI components
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+
+// AWT graphics and windowing
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import java.awt.event.ActionEvent;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
+
+// I/O and networking
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.ProtocolException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+
+// Collections and utilities
 import java.util.List;
 import java.util.*;
 import java.util.Set;
@@ -19,38 +30,149 @@ import java.util.HashSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+// Archive handling
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipFile;
 
 /**
- * Simple Swing GUI updater that looks like the classic Minecraft prompt.
- *
- * Features:
- * - Checks GitHub latest release for a mod jar (regex) and optional assets zip (regex).
- * - Prompts user with a classic-style Yes / Not now dialog before updating.
- * - Installs jar into mods/ or replaces client jar (legacy) and extracts resources/assets from a zip.
- * - Reads config from --config <file> or tools/mod-updater/updater.properties by default.
- *
- * Build (Java 8+):
+ * Minecraft Oldschool Edition Launcher - A nostalgic GUI updater styled after the classic 2011 Minecraft launcher.
+ * 
+ * =============================================================================
+ * OVERVIEW
+ * =============================================================================
+ * 
+ * This is the main launcher application that provides a graphical interface for:
+ * - Checking for and installing game updates from GitHub releases
+ * - Displaying patch notes and news
+ * - Managing launcher self-updates
+ * - Providing a faithful recreation of the classic Minecraft launcher aesthetic
+ * 
+ * The launcher runs as a Pre-Launch command in Prism Launcher or similar Minecraft
+ * launchers, appearing before the game starts to handle any necessary updates.
+ * 
+ * =============================================================================
+ * VISUAL DESIGN
+ * =============================================================================
+ * 
+ * The UI is designed to match the classic 2011 Minecraft launcher:
+ * - Dirt block tiled background
+ * - Pixelated fonts and text rendering (no antialiasing)
+ * - Classic button styling with texture-based rendering
+ * - "Updating Minecraft" progress screen with green progress bar
+ * - "New update available" prompt with Yes/Not now buttons
+ * 
+ * =============================================================================
+ * INSTALLATION MODES
+ * =============================================================================
+ * 
+ * The launcher supports three installation modes configured via updater.properties:
+ * 
+ * 1. "mods" mode (default):
+ *    - Downloads mod JAR files to the mods/ directory
+ *    - Used for modern Minecraft installations with mod loaders
+ * 
+ * 2. "clientJar" mode:
+ *    - Replaces the client minecraft.jar directly
+ *    - Used for legacy Minecraft installations (pre-1.6)
+ * 
+ * 3. "jarmods" mode:
+ *    - Installs to the Prism Launcher jarmods directory
+ *    - Used for jar-mod based installations
+ * 
+ * =============================================================================
+ * SELF-UPDATE MECHANISM
+ * =============================================================================
+ * 
+ * The launcher can update itself, but this requires special handling:
+ * - On Windows, a running JAR file cannot be replaced (file is locked)
+ * - Solution: Download update to .pending file, then use LauncherUpdatePromoter
+ *   as a Post-Exit command to apply the update after the launcher closes
+ * 
+ * =============================================================================
+ * BUILD INSTRUCTIONS
+ * =============================================================================
+ * 
+ * Requires Java 8 or later:
  *   javac -encoding UTF-8 -d out src/ModUpdaterGUI.java
  *   jar cfe mod-updater-gui.jar ModUpdaterGUI -C out .
+ * 
+ * Or use the provided build script:
+ *   Windows: build.bat
+ *   Linux/Mac: ./build.sh
+ * 
+ * =============================================================================
+ * COMMAND LINE OPTIONS
+ * =============================================================================
+ * 
+ * --config <path>      Path to updater.properties configuration file
+ * --instanceDir <path> Path to Prism/MultiMC instance directory
+ * --minecraftDir <path> Path to .minecraft directory
+ * --repo <owner/repo>  GitHub repository for game updates
+ * --betaRepo <owner/repo> GitHub repository for beta updates (optional)
+ * --jarRegex <regex>   Regex to match the mod JAR asset
+ * --assetsRegex <regex> Regex to match the assets ZIP (optional)
+ * --mode <mode>        Installation mode: mods, clientJar, or jarmods
+ * --newsUrl <url>      URL for embedded news/patch notes page
+ * 
+ * =============================================================================
+ * CONFIGURATION FILE (updater.properties)
+ * =============================================================================
+ * 
+ * The launcher reads configuration from tools/mod-updater/updater.properties:
+ * 
+ *   repo=YourOrg/YourRepo
+ *   jarRegex=YourMod-.*\\.jar
+ *   assetsRegex=assets-.*\\.zip
+ *   mode=mods
+ *   newsUrl=https://example.com/patchnotes
+ *   launcherRepo=YourOrg/launcher-updates
+ * 
+ * @author Minecraft Oldschool Edition Team
+ * @see ModUpdater CLI version of this updater
+ * @see LauncherUpdatePromoter Helper for self-update on Windows
  */
 public final class ModUpdaterGUI {
 
-    // Static initializer - MUST run before any AWT/Swing classes are loaded
+    // =========================================================================
+    // STATIC INITIALIZATION
+    // =========================================================================
+    
+    /**
+     * Static initializer block - runs before any AWT/Swing classes are loaded.
+     * 
+     * This sets up system properties needed for compatibility with various
+     * environments, particularly the Steam Deck running in game mode (gamescope).
+     * 
+     * These properties MUST be set before Swing/AWT initializes, which is why
+     * they're in a static block rather than in main().
+     */
     static {
         try {
-            // Steam Deck / Linux gamescope compatibility fixes
-            // Disable Java 2D hardware acceleration to fix blank white screen
-            System.setProperty("sun.java2d.opengl", "false");
-            System.setProperty("sun.java2d.xrender", "false");
-            System.setProperty("sun.java2d.pmoffscreen", "false");
-            System.setProperty("sun.java2d.d3d", "false");
-            System.setProperty("sun.java2d.noddraw", "true");
-            // Fix for Wayland/gamescope window manager issues
+            // =====================================================================
+            // Steam Deck / Linux Gamescope Compatibility Fixes
+            // =====================================================================
+            // 
+            // On Steam Deck in game mode, the display runs through "gamescope",
+            // a Wayland-based compositor. Java's 2D acceleration can cause issues:
+            // - Blank white screens
+            // - Rendering glitches
+            // - Window management problems
+            //
+            // Solution: Disable all hardware acceleration and force software rendering
+            
+            System.setProperty("sun.java2d.opengl", "false");      // Disable OpenGL acceleration
+            System.setProperty("sun.java2d.xrender", "false");     // Disable XRender (Linux)
+            System.setProperty("sun.java2d.pmoffscreen", "false"); // Disable offscreen pixmaps
+            System.setProperty("sun.java2d.d3d", "false");         // Disable Direct3D (Windows)
+            System.setProperty("sun.java2d.noddraw", "true");      // Disable DirectDraw (Windows)
+            
+            // Fix for Wayland/gamescope window manager interaction issues
             System.setProperty("sun.awt.disablegrab", "true");
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+            // Security manager might prevent setting properties - continue anyway
+        }
     }
     
     /**
@@ -107,71 +229,172 @@ public final class ModUpdaterGUI {
         }
     }
 
+    // =========================================================================
+    // CONSTANTS - Network Configuration
+    // =========================================================================
+    
+    /** HTTP connection and read timeout in milliseconds (15 seconds) */
     private static final int HTTP_TIMEOUT_MS = 15000;
+    
+    /** GitHub API endpoint template for fetching the latest release from a repository */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
+    
+    // =========================================================================
+    // CONSTANTS - UI Fonts and Textures
+    // =========================================================================
+    
+    /** 
+     * Base font for UI elements. Attempts to use classic JRE fonts for authentic look.
+     * Falls back to system default if classic fonts unavailable.
+     */
     private static final Font UI_BASE_FONT = detectBaseFont();
-    private static String INSTANCE_DIR; // Set from command-line args for icon loading
-    private static final Font PIXEL_FONT = loadGameFont(); // optional; if absent, we fall back to default LAF font
+    
+    /** 
+     * Instance directory path, set from command-line args.
+     * Used for loading icons and other instance-specific resources.
+     */
+    private static String INSTANCE_DIR;
+    
+    /** 
+     * Pixel-style font for retro text rendering.
+     * If the game font can't be loaded, falls back to default LAF font.
+     */
+    private static final Font PIXEL_FONT = loadGameFont();
+    
+    /** 
+     * Texture atlas for classic Minecraft-style buttons.
+     * Contains normal, hover, and pressed button states.
+     */
     private static final BufferedImage BUTTON_TEXTURE = loadButtonTexture();
 
-    // Bouncy Castle dependency for cryptographic operations (friends system)
+    // =========================================================================
+    // CONSTANTS - Bouncy Castle Cryptography Library
+    // =========================================================================
+    // 
+    // Bouncy Castle is used for cryptographic operations in the friends system.
+    // It's downloaded automatically if not present in the instance's libraries.
+    
     private static final String BC_GROUP_ID = "org.bouncycastle";
     private static final String BC_ARTIFACT_ID = "bcprov-jdk18on";
     private static final String BC_VERSION = "1.78.1";
     private static final String BC_JAR_NAME = "bcprov-jdk18on-1.78.1.jar";
     private static final String BC_MAVEN_URL = "https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar";
 
+    // =========================================================================
+    // MAIN ENTRY POINT
+    // =========================================================================
+    
+    /**
+     * Main entry point for the launcher GUI.
+     * 
+     * EXECUTION FLOW:
+     * 1. Check if Steam Deck relaunch is needed (Linux/gamescope compatibility)
+     * 2. Configure Swing look-and-feel for classic 2011 appearance
+     * 3. Parse command-line arguments and load configuration
+     * 4. Resolve paths (minecraft dir, instance dir, launcher jar)
+     * 5. Check for any pending launcher updates and apply them
+     * 6. Fetch current update state from GitHub
+     * 7. Display the launcher GUI and wait for user interaction
+     * 
+     * ERROR HANDLING:
+     * If any error occurs, it's displayed to the user but the launcher exits
+     * with code 0 to allow the game to continue starting. This prevents
+     * update failures from blocking gameplay.
+     * 
+     * @param args Command-line arguments (see class javadoc for options)
+     */
     public static void main(String[] args) {
-        // Steam Deck / gamescope fix: relaunch with correct environment if needed
+        // =====================================================================
+        // STEP 1: Steam Deck Compatibility Check
+        // =====================================================================
+        // On Steam Deck in game mode, we may need to relaunch with GDK_BACKEND=x11
+        // to ensure proper display. If relaunch is needed, this process exits and
+        // a new process with correct environment takes over.
         if (relaunchForSteamDeck(args)) {
-            System.exit(0); // Exit this process, the relaunched one will take over
+            System.exit(0);
         }
         
         try {
-            // Prefer platform look and feel and disable font antialiasing for blocky 2011-style text
+            // =================================================================
+            // STEP 2: Configure Swing Look-and-Feel
+            // =================================================================
+            // Disable font antialiasing for authentic blocky 2011-era text
             try {
                 System.setProperty("awt.useSystemAAFontSettings", "off");
                 System.setProperty("swing.aatext", "false");
             } catch (Throwable ignored) {}
-            try { UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName()); } catch (Exception ignored) {}
-            // Force classic JRE fonts (Lucida Sans family) across Swing for a 2011 look
+            
+            // Use cross-platform (Metal) look-and-feel for consistent appearance
+            try { 
+                UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName()); 
+            } catch (Exception ignored) {}
+            
+            // Apply classic JRE fonts (Lucida Sans family) for authentic 2011 look
             try {
                 Font baseUi = new Font("Lucida Sans", Font.PLAIN, 12);
                 applyUIFont(baseUi);
             } catch (Throwable ignored) {}
+            
+            // =================================================================
+            // STEP 3: Parse Arguments and Load Configuration
+            // =================================================================
             Map<String, String> cli = parseArgs(args);
             Properties cfg = loadConfig(cli.get("--config"));
 
+            // Required: GitHub repository for game updates (e.g., "YourOrg/YourMod")
             String repo = value(cli, cfg, "repo", null);
-            if (repo == null) throw new IllegalArgumentException("Missing 'repo' (owner/repo). Provide in --config or as --repo.");
+            if (repo == null) {
+                throw new IllegalArgumentException("Missing 'repo' (owner/repo). Provide in --config or as --repo.");
+            }
 
-            // Optional secondary repo for beta releases (owner/repo format)
+            // Optional: Secondary repository for beta/development releases
             String betaRepo = value(cli, cfg, "betaRepo", null);
 
-            String jarRegex = value(cli, cfg, "jarRegex", ".*\\.jar");
-            String assetsRegex = value(cli, cfg, "assetsRegex", null); // optional
-            String mode = value(cli, cfg, "mode", "mods"); // mods | clientJar | jarmods
-            String jarmodName = value(cli, cfg, "jarmodName", "mod.jar");
-            String newsUrl = value(cli, cfg, "newsUrl", null); // optional embedded news / patch notes page
+            // Regex patterns for identifying release assets
+            String jarRegex = value(cli, cfg, "jarRegex", ".*\\.jar");      // Pattern for mod JAR
+            String assetsRegex = value(cli, cfg, "assetsRegex", null);       // Pattern for assets ZIP (optional)
             
-            // Auto-migrate old newsUrl to new domain
+            // Installation mode: mods (default), clientJar (legacy), or jarmods
+            String mode = value(cli, cfg, "mode", "mods");
+            String jarmodName = value(cli, cfg, "jarmodName", "mod.jar");
+            
+            // Optional URL for embedded news/patch notes page
+            String newsUrl = value(cli, cfg, "newsUrl", null);
+            
+            // Auto-migrate old newsUrl to new domain if needed
             newsUrl = migrateNewsUrl(newsUrl, cfg, cli.get("--config"));
             
+            // Launcher self-update configuration
             String launcherRepo = value(cli, cfg, "launcherRepo", "MinecraftOldschoolEdition/launcher-updates");
             String launcherJarRegex = value(cli, cfg, "launcherJarRegex", "mod-updater-gui\\.jar");
 
+            // =================================================================
+            // STEP 4: Resolve Directory Paths
+            // =================================================================
+            // Resolve the .minecraft directory from various sources
             Path minecraftDir = resolveMinecraftDir(
                 firstNonNull(cli.get("--minecraftDir"), cfg.getProperty("minecraftDir")),
                 firstNonNull(cli.get("--instanceDir"), cfg.getProperty("instanceDir")),
                 getenv("MC_DIR")
             );
-            if (minecraftDir == null) throw new IllegalArgumentException("Unable to resolve Minecraft directory. Set minecraftDir in config or pass --minecraftDir / --instanceDir.");
+            if (minecraftDir == null) {
+                throw new IllegalArgumentException("Unable to resolve Minecraft directory. Set minecraftDir in config or pass --minecraftDir / --instanceDir.");
+            }
 
+            // Resolve the instance root directory (parent of .minecraft in Prism)
             Path instanceRoot = resolveInstanceRoot(minecraftDir, firstNonNull(cli.get("--instanceDir"), cfg.getProperty("instanceDir")));
-            INSTANCE_DIR = firstNonNull(cli.get("--instanceDir"), cfg.getProperty("instanceDir")); // Store for icon loading
+            INSTANCE_DIR = firstNonNull(cli.get("--instanceDir"), cfg.getProperty("instanceDir"));
 
+            // =================================================================
+            // STEP 5: Handle Pending Launcher Updates
+            // =================================================================
+            // Find where this JAR is running from
             Path launcherJarPath = locateSelfJar();
+            
+            // Apply any staged launcher update (from previous session)
             applyStagedLauncherUpdate(launcherJarPath, instanceRoot);
+            
+            // For jarmods mode, try to derive the jarmod name from existing files
             if (instanceRoot != null) {
                 String derivedJarmod = derivePatchJarmodName(instanceRoot, jarmodName);
                 if (derivedJarmod != null && derivedJarmod.length() > 0) {
@@ -179,22 +402,37 @@ public final class ModUpdaterGUI {
                 }
             }
 
+            // =================================================================
+            // STEP 6: Fetch Update State from GitHub
+            // =================================================================
+            // Check if beta updates are enabled in config
             boolean useBetaUpdates = "true".equalsIgnoreCase(cfg.getProperty("useBetaUpdates"));
+            
+            // Fetch the current update state (checks installed version vs latest release)
             BranchContext branch = fetchBranchState(useBetaUpdates, repo, betaRepo, jarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
+            
+            // Find the dirt background image for the classic look
             Path bgPath = findBgPath(minecraftDir);
 
+            // Determine config file path for saving settings changes
             String cliConfig = cli.get("--config");
             Path configPath = (cliConfig != null) ? Paths.get(cliConfig) : Paths.get("tools", "mod-updater", "updater.properties");
 
+            // =================================================================
+            // STEP 7: Build Launcher State and Show GUI
+            // =================================================================
+            // Package all state into a single object for the GUI
             LauncherState state = new LauncherState();
-            state.hasUpdate = !branch.upToDate;
-            state.releaseRepo = repo;
-            state.betaRepo = betaRepo;
-            state.useBetaUpdates = useBetaUpdates;
-            state.configPath = configPath;
-            state.instanceRoot = instanceRoot;
+            state.hasUpdate = !branch.upToDate;           // Is a game update available?
+            state.releaseRepo = repo;                      // Main release repository
+            state.betaRepo = betaRepo;                     // Beta release repository
+            state.useBetaUpdates = useBetaUpdates;         // Beta updates enabled?
+            state.configPath = configPath;                 // Path to config file
+            state.instanceRoot = instanceRoot;             // Instance root directory
             state.launcherUpdate = checkLauncherUpdate(launcherRepo, launcherJarRegex, launcherJarPath, instanceRoot);
-            state.branch = branch;
+            state.branch = branch;                         // Current branch context
+            
+            // Display the launcher GUI (blocks until user closes it)
             showLauncher(bgPath, minecraftDir, instanceRoot, mode, jarRegex, assetsRegex, jarmodName, state, newsUrl);
         } catch (Throwable t) {
             // If the updater fails for any reason, log/show the error but do NOT
@@ -723,6 +961,11 @@ public final class ModUpdaterGUI {
             final LauncherState launcherState,
             final String newsUrl) {
 
+        // Use a latch to keep the main thread alive until the GUI window closes.
+        // Without this, the main thread exits immediately after invokeLater returns,
+        // and the JVM may terminate before the Swing EDT can display the window.
+        final CountDownLatch windowClosedLatch = new CountDownLatch(1);
+
         SwingUtilities.invokeLater(new Runnable() {
             public void run() {
                 final JFrame frame = new JFrame("Minecraft Oldschool Edition Launcher");
@@ -790,12 +1033,12 @@ public final class ModUpdaterGUI {
                 promptPage.setLayout(new BorderLayout());
                 promptPage.setBorder(new EmptyBorder(24, 24, 50, 24));
 
-                PixelLabel promptTitle = new PixelLabel("New update available", 34f, true);
+                PixelLabel promptTitle = new PixelLabel("New update available", 18f, true);
                 promptTitle.setForeground(new Color(202, 202, 202)); // #CACACA
-                PixelLabel promptSubtitle = new PixelLabel("Would you like to update?", 23f, false);
+                PixelLabel promptSubtitle = new PixelLabel("Would you like to update?", 12f, false);
                 promptSubtitle.setForeground(new Color(202, 202, 202)); // #CACACA
 
-                JPanel promptButtonsRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 40, 0));
+                JPanel promptButtonsRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 20, 0));
                 JButton yesButton = new PixelButton("Yes");
                 JButton noButton = new PixelButton("Not now");
                 promptButtonsRow.add(yesButton);
@@ -850,11 +1093,12 @@ public final class ModUpdaterGUI {
                         yesButton.revalidate();
                         noButton.revalidate();
                         int sidePad = 48 * k;
-                        int topPad = Math.max(16 * k, (int) Math.round(frame.getHeight() * 0.10)) + 25 * k;
+                        // Position content in upper area like the original launcher
+                        int topPad = (int) Math.round(frame.getHeight() * 0.15);
                         promptPage.setBorder(new EmptyBorder(topPad, sidePad, sidePad, sidePad));
-                        Dimension sp1 = new Dimension(1, 32 * k);
+                        Dimension sp1 = new Dimension(1, 12 * k);
                         spacer1.setPreferredSize(sp1); spacer1.setMinimumSize(sp1); spacer1.setMaximumSize(new Dimension(Integer.MAX_VALUE, sp1.height));
-                        Dimension sp2 = new Dimension(1, Math.max(2, 2 * k));
+                        Dimension sp2 = new Dimension(1, 8 * k);
                         spacer2.setPreferredSize(sp2); spacer2.setMinimumSize(sp2); spacer2.setMaximumSize(new Dimension(Integer.MAX_VALUE, sp2.height));
                         if (promptButtonsRow.getLayout() instanceof FlowLayout) {
                             ((FlowLayout) promptButtonsRow.getLayout()).setHgap(30 * k);
@@ -1094,9 +1338,25 @@ public final class ModUpdaterGUI {
                     }
                 });
 
+                // Release the main-thread latch when the window is closed so the JVM can exit.
+                frame.addWindowListener(new java.awt.event.WindowAdapter() {
+                    @Override
+                    public void windowClosed(java.awt.event.WindowEvent e) {
+                        windowClosedLatch.countDown();
+                    }
+                });
+
                 frame.setVisible(true);
             }
         });
+
+        // Block the main thread until the window is closed. This ensures the JVM stays
+        // alive even if the EDT hasn't fully started processing before main() would return.
+        try {
+            windowClosedLatch.await();
+        } catch (InterruptedException ignored) {
+            // If interrupted, just let the program exit normally.
+        }
     }
 
     private static void runLauncherSelfUpdate(
@@ -1355,12 +1615,12 @@ public final class ModUpdaterGUI {
         panel.setLayout(new BorderLayout());
         panel.setBorder(new EmptyBorder(24, 24, 50, 24));
 
-        PixelLabel title = new PixelLabel("New update available", 34f, true);
+        PixelLabel title = new PixelLabel("New update available", 18f, true);
         title.setForeground(new Color(202, 202, 202)); // #CACACA
-        PixelLabel subtitle = new PixelLabel("Would you like to update?", 23f, false);
+        PixelLabel subtitle = new PixelLabel("Would you like to update?", 12f, false);
         subtitle.setForeground(new Color(202, 202, 202)); // #CACACA
 
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 40, 0));
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 20, 0));
         JButton yes = new PixelButton("Yes");
         JButton no = new PixelButton("Not now");
         buttons.add(yes);
@@ -1426,14 +1686,14 @@ public final class ModUpdaterGUI {
                 yes.revalidate();
                 no.revalidate();
                 int sidePad = 48 * k;
-                // Move content down just a bit: base 10% + small k-based nudge
-                int topPad = Math.max(16 * k, (int) Math.round(frame.getHeight() * 0.10)) + 25 * k;
+                // Position content in upper area like the original launcher
+                int topPad = (int) Math.round(frame.getHeight() * 0.15);
                 panel.setBorder(new EmptyBorder(topPad, sidePad, sidePad, sidePad));
-                // Increase space between title and subtitle
-                Dimension sp1 = new Dimension(1, 32 * k);
+                // Space between title and subtitle (faithful to original)
+                Dimension sp1 = new Dimension(1, 12 * k);
                 spacer1.setPreferredSize(sp1); spacer1.setMinimumSize(sp1); spacer1.setMaximumSize(new Dimension(Integer.MAX_VALUE, sp1.height));
-                // Reduce space between subtitle and buttons (nearly flush)
-                Dimension sp2 = new Dimension(1, Math.max(2, 2 * k));
+                // Space between subtitle and buttons
+                Dimension sp2 = new Dimension(1, 8 * k);
                 spacer2.setPreferredSize(sp2); spacer2.setMinimumSize(sp2); spacer2.setMaximumSize(new Dimension(Integer.MAX_VALUE, sp2.height));
                 // tighten gap between buttons and keep row close to subtitle
                 if (buttons.getLayout() instanceof FlowLayout) {
@@ -2447,46 +2707,43 @@ public final class ModUpdaterGUI {
             int h = getHeight();
             drawBackground(g, w, h, bg);
 
-            // Title
+            // Title - positioned to match original exactly
             String title = "Updating Minecraft";
             // Integer scaling using ceiling so text scales sooner when window grows
             double layout = Math.min(w / 854.0, h / 480.0);
             int kk = (int) Math.max(1, Math.ceil(layout - 1e-6));
-            double s = kk;
             Font base = UI_BASE_FONT != null ? UI_BASE_FONT : getFont();
-            BufferedImage titleImg = renderTextRaster(title, base.deriveFont(Font.BOLD, 34f), fg);
+            BufferedImage titleImg = renderTextRaster(title, base.deriveFont(Font.BOLD, 30f), fg);
             int tsw = titleImg.getWidth() * kk;
             int tsh = titleImg.getHeight() * kk;
             int tx = (w - tsw) / 2;
-            // Move the title further down to better match the original
-            int ty = Math.max(0, (int) Math.round(h * 0.18)) + 8 * kk;
+            // Position title at ~30% from top like original
+            int ty = (int) Math.round(h * 0.30) - tsh / 2;
             Object oldI = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
             g.drawImage(titleImg, tx, ty, tsw, tsh, null);
             if (oldI != null) g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, oldI);
 
-            // Phase text
+            // Phase text - centered vertically like original
             String p = phase != null ? phase : "";
-            BufferedImage phaseImg = renderTextRaster(p, base.deriveFont(Font.PLAIN, 20f), sub);
+            BufferedImage phaseImg = renderTextRaster(p, base.deriveFont(Font.PLAIN, 18f), sub);
             int psw = phaseImg.getWidth() * kk;
             int psh = phaseImg.getHeight() * kk;
             int px = (w - psw) / 2;
-            // Place subtitle midway between title bottom and progress bar top
-            int barYForPhase = h - 60 * kk; // must match barY below
-            int titleBottom = ty + tsh;
-            int gap = Math.max(0, barYForPhase - titleBottom);
-            int py = titleBottom + Math.max(0, (gap - psh) / 2);
+            // Position phase text at ~50% from top (center) like original
+            int py = (int) Math.round(h * 0.50) - psh / 2;
             oldI = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
             g.drawImage(phaseImg, px, py, psw, psh, null);
             if (oldI != null) g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, oldI);
 
-            // Progress bar: longer and slightly closer to bottom (match OG look)
+            // Progress bar: positioned at ~83% from top like original
             int barW = Math.max(200 * kk, w - 160 * kk);
-            // Thinner bar for authentic look
-            int barH = Math.max(6, 8 * kk);
+            // Thin bar matching original
+            int barH = Math.max(4, 6 * kk);
             int barX = (w - barW) / 2;
-            int barY = h - 60 * kk;
+            // Position at 83% from top like original
+            int barY = (int) Math.round(h * 0.83);
             g.setColor(barBg);
             g.fillRect(barX, barY, barW, barH);
             int fill = (int) Math.round(barW * progress);
