@@ -18,7 +18,7 @@ if errorlevel 1 (
 
 REM Compile GUI updater
 echo Compiling ModUpdaterGUI.java...
-javac -encoding UTF-8 -d out src/ModUpdaterGUI.java
+javac -encoding UTF-8 -d out src/ModUpdaterGUI.java src/LauncherBootstrap.java
 if errorlevel 1 (
     echo Build failed: ModUpdaterGUI.java
     exit /b 1
@@ -45,7 +45,7 @@ if errorlevel 1 (
 
 REM Create GUI jar
 echo Creating mod-updater-gui.jar...
-jar cfe mod-updater-gui.jar ModUpdaterGUI -C out .
+jar cfe mod-updater-gui.jar LauncherBootstrap -C out .
 if errorlevel 1 (
     echo Build failed: jar creation for GUI
     exit /b 1
