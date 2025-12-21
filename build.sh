@@ -10,13 +10,13 @@ echo "Building Mod Updater..."
 rm -rf out
 mkdir -p out
 
-# Compile CLI updater
+# Compile CLI updater (targeting Java 8 for Prism Launcher compatibility)
 echo "Compiling ModUpdater.java..."
-javac -encoding UTF-8 -d out src/ModUpdater.java
+javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d out src/ModUpdater.java
 
-# Compile GUI updater
+# Compile GUI updater (targeting Java 8 for Prism Launcher compatibility)
 echo "Compiling ModUpdaterGUI.java..."
-javac -encoding UTF-8 -d out src/ModUpdaterGUI.java src/LauncherBootstrap.java
+javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d out src/ModUpdaterGUI.java src/LauncherBootstrap.java
 
 # Copy bg.png resource to output (if needed by GUI)
 if [ -f src/bg.png ]; then

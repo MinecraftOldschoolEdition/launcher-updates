@@ -302,6 +302,9 @@ public final class ModUpdaterGUI {
             // Launcher self-update configuration
             String launcherRepo = value(cli, cfg, "launcherRepo", "MinecraftOldschoolEdition/launcher-updates");
             String launcherJarRegex = value(cli, cfg, "launcherJarRegex", "mod-updater-gui\\.jar");
+            
+            // Resource pack repository (assets synced before each launch)
+            String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
 
             // =================================================================
             // STEP 4: Resolve Directory Paths
@@ -366,6 +369,8 @@ public final class ModUpdaterGUI {
             state.instanceRoot = instanceRoot;             // Instance root directory
             state.launcherUpdate = checkLauncherUpdate(launcherRepo, launcherJarRegex, launcherJarPath, instanceRoot);
             state.branch = branch;                         // Current branch context
+            state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
+            state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             
             // Display the launcher GUI (blocks until user closes it)
             showLauncher(bgPath, minecraftDir, instanceRoot, mode, jarRegex, assetsRegex, jarmodName, state, newsUrl);
@@ -434,6 +439,7 @@ public final class ModUpdaterGUI {
         sb.append("jarmodName=mod.jar").append(newline);
         sb.append("minecraftDir=../../minecraft/game").append(newline);
         sb.append("newsUrl=https://minecraftoldschool.com/updates.html").append(newline);
+        sb.append("resourcePackRepo=MinecraftOldschoolEdition/resourcepack").append(newline);
         Files.write(configPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -558,6 +564,8 @@ public final class ModUpdaterGUI {
         BranchContext branch;
         LauncherUpdateState launcherUpdate;
         Path instanceRoot;
+        String resourcePackRepo;
+        Path minecraftDir;
     }
 
     private static final class BranchContext {
@@ -1189,10 +1197,11 @@ public final class ModUpdaterGUI {
                     public void actionPerformed(ActionEvent e) {
                         boolean needsUpdate = launcherState != null && (launcherState.forceUpdate || launcherState.hasUpdate);
                         if (needsUpdate) {
-                                                    showPrompt();
-                                                } else {
-                                                    System.exit(0);
-                                                }
+                            showPrompt();
+                        } else {
+                            // Show update screen and sync resource pack before launching
+                            launchWithResourcePackSync();
+                        }
                     }
 
                     private void showPrompt() {
@@ -1201,6 +1210,34 @@ public final class ModUpdaterGUI {
                         bottomBg.revalidate();
                         root.revalidate();
                         root.repaint();
+                    }
+                    
+                    private void launchWithResourcePackSync() {
+                        cards.show(cardPanel, "update");
+                        bottomBg.setVisible(false);
+                        root.revalidate();
+                        root.repaint();
+                        final ProgressUI ui = new EmbeddedProgressUI(progressCanvas);
+                        Thread t = new Thread(new Runnable() {
+                            public void run() {
+                                try {
+                                    if (launcherState != null && launcherState.resourcePackRepo != null) {
+                                        ui.setPhaseText("Syncing resource pack...");
+                                        ui.progress(10);
+                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                    }
+                                    ui.setPhaseText("Done loading");
+                                    ui.progress(100);
+                                    try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
+                                    System.exit(0);
+                                } catch (Throwable ex) {
+                                    showError(ex);
+                                    System.exit(1);
+                                }
+                            }
+                        }, "ModUpdater-ResourcePackSync");
+                        t.setDaemon(false); // Don't let JVM exit before thread completes
+                        t.start();
                     }
                 });
 
@@ -1249,6 +1286,13 @@ public final class ModUpdaterGUI {
                                             jarmodName);
 
                                     runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.assetsZip, ctx.latest, jarmodName);
+                                    
+                                    // Sync resource pack before launching
+                                    ui.setPhaseText("Syncing resource pack...");
+                                    if (launcherState != null) {
+                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                    }
+                                    
                                     ui.setPhaseText("Done loading");
                                     ui.progress(100);
                                     try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
@@ -1263,13 +1307,37 @@ public final class ModUpdaterGUI {
                                 }
                             }
                         }, "ModUpdater-Update");
-                        t.setDaemon(true);
+                        t.setDaemon(false); // Don't let JVM exit before update/sync completes
                         t.start();
                     }
                 });
                 noButton.addActionListener(new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
-                        System.exit(0);
+                        // Show update screen and sync resource pack before launching
+                        cards.show(cardPanel, "update");
+                        root.revalidate();
+                        root.repaint();
+                        final ProgressUI ui = new EmbeddedProgressUI(progressCanvas);
+                        Thread t = new Thread(new Runnable() {
+                            public void run() {
+                                try {
+                                    if (launcherState != null && launcherState.resourcePackRepo != null) {
+                                        ui.setPhaseText("Syncing resource pack...");
+                                        ui.progress(10);
+                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                    }
+                                    ui.setPhaseText("Done loading");
+                                    ui.progress(100);
+                                    try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
+                                    System.exit(0);
+                                } catch (Throwable ex) {
+                                    showError(ex);
+                                    System.exit(1);
+                                }
+                            }
+                        }, "ModUpdater-ResourcePackSync");
+                        t.setDaemon(false);
+                        t.start();
                     }
                 });
 
@@ -1726,6 +1794,106 @@ public final class ModUpdaterGUI {
         // Note: Bouncy Castle dependency for friends system crypto is optional.
         // The friends system works without it (just without cryptographic verification).
         // Users who want crypto can manually add bcprov-jdk18on-1.78.1.jar as a jarmod.
+    }
+    
+    /**
+     * Syncs the resource pack from a GitHub repository before launching the game.
+     * Downloads the repository's main branch as a zipball and extracts the assets/
+     * folder to the Minecraft resources directory.
+     *
+     * @param repo        GitHub repository in "owner/repo" format
+     * @param minecraftDir Path to the .minecraft directory
+     */
+    private static void syncResourcePack(String repo, Path minecraftDir) {
+        if (repo == null || repo.isEmpty() || minecraftDir == null) {
+            return;
+        }
+        
+        System.out.println("[mod-updater] Syncing resource pack from: " + repo);
+        
+        try {
+            // Download the repository as a zipball from the main branch
+            String zipUrl = "https://github.com/" + repo + "/archive/refs/heads/main.zip";
+            String tmpDir = System.getProperty("java.io.tmpdir");
+            Path zipPath = Paths.get(tmpDir, "resourcepack-" + System.currentTimeMillis() + ".zip");
+            
+            URL url = new URL(zipUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+            conn.setReadTimeout(HTTP_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+            conn.setInstanceFollowRedirects(true);
+            
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                System.err.println("[mod-updater] Failed to download resource pack: HTTP " + code);
+                return;
+            }
+            
+            // Download the zip file
+            InputStream in = new BufferedInputStream(conn.getInputStream());
+            FileOutputStream out = new FileOutputStream(zipPath.toFile());
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            try {
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+            } finally {
+                try { in.close(); } catch (IOException ignored) {}
+                try { out.close(); } catch (IOException ignored) {}
+            }
+            
+            // Extract assets/ folder to resources/
+            Path resourcesDir = minecraftDir.resolve("resources");
+            ensureDir(resourcesDir);
+            
+            ZipInputStream zis = new ZipInputStream(new FileInputStream(zipPath.toFile()));
+            ZipEntry entry;
+            int extractedCount = 0;
+            try {
+                while ((entry = zis.getNextEntry()) != null) {
+                    String name = entry.getName().replace('\\', '/');
+                    
+                    // Skip the root folder (e.g., "resourcepack-main/")
+                    int slashIdx = name.indexOf('/');
+                    if (slashIdx < 0) continue;
+                    String relativePath = name.substring(slashIdx + 1);
+                    
+                    // Only extract files under assets/
+                    if (!relativePath.startsWith("assets/")) continue;
+                    if (entry.isDirectory()) continue;
+                    
+                    // Target path: resources/assets/...
+                    Path dest = resourcesDir.resolve(relativePath);
+                    ensureDir(dest.getParent());
+                    
+                    FileOutputStream fos = new FileOutputStream(dest.toFile());
+                    try {
+                        while ((n = zis.read(buf)) != -1) {
+                            fos.write(buf, 0, n);
+                        }
+                        extractedCount++;
+                    } finally {
+                        try { fos.close(); } catch (IOException ignored) {}
+                    }
+                    
+                    zis.closeEntry();
+                }
+            } finally {
+                try { zis.close(); } catch (IOException ignored) {}
+            }
+            
+            // Clean up the downloaded zip
+            Files.deleteIfExists(zipPath);
+            
+            System.out.println("[mod-updater] Resource pack synced: " + extractedCount + " files extracted to " + resourcesDir);
+            
+        } catch (Exception e) {
+            // Don't fail the launch if resource pack sync fails
+            System.err.println("[mod-updater] Warning: Failed to sync resource pack: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
     
     /**
