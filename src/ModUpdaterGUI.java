@@ -2247,14 +2247,14 @@ public final class ModUpdaterGUI {
             InputStream fallbackIn = fallbackCode >= 200 && fallbackCode < 300 ? fallbackConn.getInputStream() : fallbackConn.getErrorStream();
             String fallbackBody = readAll(fallbackIn);
             if (fallbackCode < 200 || fallbackCode >= 300) {
-                throw new IOException("GitHub API error: HTTP " + fallbackCode + "\n" + fallbackBody);
+                throw new IOException("GitHub API error: HTTP " + fallbackCode + " " + truncateErrorBody(fallbackBody));
             }
             // Parse first release from array
             return parseFirstReleaseFromArray(fallbackBody);
         }
         
         if (code < 200 || code >= 300) {
-            throw new IOException("GitHub API error: HTTP " + code + "\n" + body);
+            throw new IOException("GitHub API error: HTTP " + code + " " + truncateErrorBody(body));
         }
         return parseLatestRelease(body);
     }
@@ -2506,6 +2506,20 @@ public final class ModUpdaterGUI {
             sb.append(buf, 0, n);
         }
         return sb.toString();
+    }
+    
+    /** Truncate error body to avoid dumping huge HTML error pages to console */
+    private static String truncateErrorBody(String body) {
+        if (body == null) return "";
+        // If it looks like HTML, just note that
+        if (body.trim().startsWith("<!DOCTYPE") || body.trim().startsWith("<html")) {
+            return "(HTML error page received)";
+        }
+        // Truncate long responses
+        if (body.length() > 500) {
+            return body.substring(0, 500) + "... (truncated)";
+        }
+        return body;
     }
 
     private static Path findExistingMatching(Path dir, String assetRegex) throws IOException {
