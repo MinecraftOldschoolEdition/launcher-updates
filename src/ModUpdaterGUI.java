@@ -151,6 +151,21 @@ public final class ModUpdaterGUI {
     static {
         try {
             // =====================================================================
+            // macOS AWT Toolkit Fix (MUST be first, before any AWT classes load)
+            // =====================================================================
+            //
+            // On macOS, Java sometimes defaults to X11 toolkit (especially when
+            // launched from certain environments like Prism Launcher). This causes:
+            //   java.awt.AWTError: Toolkit not found: sun.awt.X11.XToolkit
+            //
+            // Solution: Explicitly set the native macOS toolkit before AWT initializes.
+            
+            String osName = System.getProperty("os.name", "").toLowerCase();
+            if (osName.contains("mac")) {
+                System.setProperty("awt.toolkit", "sun.lwawt.macosx.LWCToolkit");
+            }
+            
+            // =====================================================================
             // Steam Deck / Linux Gamescope Compatibility Fixes
             // =====================================================================
             // 
@@ -1226,6 +1241,11 @@ public final class ModUpdaterGUI {
                                         ui.progress(10);
                                         syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
                                     }
+                                    // Install macOS patches if needed
+                                    if (launcherState != null) {
+                                        installMacOSPatch(launcherState.instanceRoot);
+                                        installNetMinecraftJsonPatch(launcherState.instanceRoot);
+                                    }
                                     ui.setPhaseText("Done loading");
                                     ui.progress(100);
                                     try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
@@ -1291,6 +1311,9 @@ public final class ModUpdaterGUI {
                                     ui.setPhaseText("Syncing resource pack...");
                                     if (launcherState != null) {
                                         syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                        // Install macOS patches if needed
+                                        installMacOSPatch(launcherState.instanceRoot);
+                                        installNetMinecraftJsonPatch(launcherState.instanceRoot);
                                     }
                                     
                                     ui.setPhaseText("Done loading");
@@ -1326,6 +1349,11 @@ public final class ModUpdaterGUI {
                                         ui.progress(10);
                                         syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
                                     }
+                                    // Install macOS patches if needed
+                                    if (launcherState != null) {
+                                        installMacOSPatch(launcherState.instanceRoot);
+                                        installNetMinecraftJsonPatch(launcherState.instanceRoot);
+                                    }
                                     ui.setPhaseText("Done loading");
                                     ui.progress(100);
                                     try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
@@ -1350,6 +1378,9 @@ public final class ModUpdaterGUI {
                 });
 
                 frame.setVisible(true);
+                
+                // Note: The game now automatically re-launches itself with -XstartOnFirstThread
+                // on macOS when needed, so we no longer need to warn about JVM arguments.
             }
         });
 
@@ -1497,6 +1528,35 @@ public final class ModUpdaterGUI {
             }
         });
         center.add(pathLink, c);
+
+        // Clear Backups row - deletes old .bak files (renamed jars from previous updates)
+        c.gridx = 0;
+        c.gridy = 2;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
+        c.insets = new Insets(6, 0, 4, 8);
+        JLabel backupsLabel = new JLabel("Old version backups:");
+        center.add(backupsLabel, c);
+
+        c.gridx = 1;
+        final JButton clearBackupsButton = new JButton("Clear Backups");
+        final Path finalMinecraftDir = minecraftDir;
+        final Path finalInstanceRoot = launcherState != null ? launcherState.instanceRoot : null;
+        clearBackupsButton.addActionListener(new AbstractAction() {
+            public void actionPerformed(ActionEvent e) {
+                int deleted = clearBackupFiles(finalMinecraftDir, finalInstanceRoot);
+                if (deleted > 0) {
+                    JOptionPane.showMessageDialog(dialog,
+                            "Deleted " + deleted + " backup file" + (deleted == 1 ? "" : "s") + ".",
+                            "Backups Cleared", JOptionPane.INFORMATION_MESSAGE);
+                } else {
+                    JOptionPane.showMessageDialog(dialog,
+                            "No backup files found to delete.",
+                            "Backups Cleared", JOptionPane.INFORMATION_MESSAGE);
+                }
+            }
+        });
+        center.add(clearBackupsButton, c);
 
         root.add(center, BorderLayout.CENTER);
 
@@ -1893,6 +1953,126 @@ public final class ModUpdaterGUI {
             // Don't fail the launch if resource pack sync fails
             System.err.println("[mod-updater] Warning: Failed to sync resource pack: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+    
+    /**
+     * Installs the macOS LWJGL3 patch that tells Prism to add -XstartOnFirstThread.
+     * This is how modern Minecraft handles GLFW's main thread requirement on macOS.
+     * The patch file tells Prism Launcher to add the required JVM argument automatically.
+     * 
+     * @param instanceRoot The Prism instance root directory
+     */
+    private static void installMacOSPatch(Path instanceRoot) {
+        // Only needed on macOS
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("mac")) {
+            return;
+        }
+        
+        Path patchesDir = instanceRoot.resolve("patches");
+        Path patchFile = patchesDir.resolve("lwjgl3-macos.json");
+        
+        // Check if already installed with current version (1.1.0 adds headless mode)
+        if (Files.exists(patchFile)) {
+            try {
+                String content = new String(Files.readAllBytes(patchFile), "UTF-8");
+                if (content.contains("\"version\": \"1.1.0\"") && content.contains("headless")) {
+                    return; // Already up to date
+                }
+                // Old version - delete and reinstall
+                Files.delete(patchFile);
+                System.out.println("[mod-updater] Updating macOS patch to v1.1.0 (adds headless mode)");
+            } catch (Exception e) {
+                // If can't read, try to reinstall
+            }
+        }
+        
+        try {
+            ensureDir(patchesDir);
+            
+            // Create the patch file that tells Prism to add macOS-specific JVM args
+            // XstartOnFirstThread is needed for GLFW, headless=true allows AWT operations
+            String patchContent = 
+                "{\n" +
+                "    \"formatVersion\": 1,\n" +
+                "    \"name\": \"LWJGL 3 macOS Support\",\n" +
+                "    \"uid\": \"org.lwjgl3.macos.fix\",\n" +
+                "    \"version\": \"1.1.0\",\n" +
+                "    \"+traits\": [\n" +
+                "        \"XstartOnFirstThread\"\n" +
+                "    ],\n" +
+                "    \"+jvmArgs\": [\n" +
+                "        \"-Djava.awt.headless=true\"\n" +
+                "    ],\n" +
+                "    \"requires\": [],\n" +
+                "    \"compatibleJavaMajors\": [8, 11, 17, 21]\n" +
+                "}\n";
+            
+            Files.write(patchFile, patchContent.getBytes("UTF-8"));
+            System.out.println("[mod-updater] Installed macOS LWJGL3 patch: " + patchFile);
+            
+        } catch (Exception e) {
+            System.err.println("[mod-updater] Warning: Failed to install macOS patch: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Installs the custom net.minecraft.json patch for macOS compatibility.
+     * Downloads from GitHub if not already present in the patches directory.
+     * This patch is essential for proper game operation on macOS.
+     * 
+     * @param instanceRoot The Prism instance root directory
+     */
+    private static void installNetMinecraftJsonPatch(Path instanceRoot) {
+        // Only needed on macOS
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("mac")) {
+            return;
+        }
+        
+        Path patchesDir = instanceRoot.resolve("patches");
+        Path patchFile = patchesDir.resolve("net.minecraft.json");
+        
+        // Check if already installed
+        if (Files.exists(patchFile)) {
+            System.out.println("[mod-updater] net.minecraft.json patch already installed");
+            return;
+        }
+        
+        try {
+            ensureDir(patchesDir);
+            
+            // Download from GitHub releases
+            String downloadUrl = "https://github.com/MinecraftOldschoolEdition/net.minecraft.json/releases/download/1.0/net.minecraft.json";
+            System.out.println("[mod-updater] Downloading net.minecraft.json from GitHub...");
+            
+            URL url = new URL(downloadUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+            conn.setReadTimeout(HTTP_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+            conn.setInstanceFollowRedirects(true);
+            
+            int responseCode = conn.getResponseCode();
+            if (responseCode != 200) {
+                System.err.println("[mod-updater] Failed to download net.minecraft.json: HTTP " + responseCode);
+                return;
+            }
+            
+            // Download and write to patch file
+            try (InputStream in = new BufferedInputStream(conn.getInputStream());
+                 FileOutputStream out = new FileOutputStream(patchFile.toFile())) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+            }
+            System.out.println("[mod-updater] Installed net.minecraft.json patch: " + patchFile);
+            
+        } catch (Exception e) {
+            System.err.println("[mod-updater] Warning: Failed to install net.minecraft.json patch: " + e.getMessage());
         }
     }
     
@@ -2553,6 +2733,131 @@ public final class ModUpdaterGUI {
         String stamp = String.valueOf(System.currentTimeMillis());
         Path parent = path.getParent();
         return parent.resolve(name + suffix + "." + stamp);
+    }
+
+    /**
+     * Clears all .bak backup files from the jarmods directory.
+     * These are the old version jars that were renamed during updates.
+     * 
+     * @param minecraftDir The .minecraft directory (unused, kept for API compatibility)
+     * @param instanceRoot The Prism/MultiMC instance root (for jarmods)
+     * @return The number of backup files deleted
+     */
+    private static int clearBackupFiles(Path minecraftDir, Path instanceRoot) {
+        int deleted = 0;
+        
+        if (instanceRoot == null) {
+            System.err.println("[mod-updater] Cannot clear backups: instance root not set");
+            return 0;
+        }
+        
+        // Only scan jarmods directory for .bak files
+        Path jarmodsDir = instanceRoot.resolve("jarmods");
+        
+        if (!Files.isDirectory(jarmodsDir)) {
+            System.out.println("[mod-updater] No jarmods directory found at: " + jarmodsDir);
+            return 0;
+        }
+        
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(jarmodsDir, "*.bak*")) {
+            for (Path bakFile : stream) {
+                try {
+                    Files.deleteIfExists(bakFile);
+                    deleted++;
+                    System.out.println("[mod-updater] Deleted backup: " + bakFile.getFileName());
+                } catch (IOException ex) {
+                    System.err.println("[mod-updater] Failed to delete backup " + bakFile + ": " + ex.getMessage());
+                }
+            }
+        } catch (IOException ex) {
+            System.err.println("[mod-updater] Failed to scan jarmods directory for backups: " + ex.getMessage());
+        }
+        
+        return deleted;
+    }
+
+    /**
+     * The required JVM argument for proper window behavior on macOS.
+     * This prevents issues with window decorations and focus.
+     */
+    private static final String REQUIRED_JVM_ARG = "-Djava.awt.headless=true";
+
+    /**
+     * Checks if the instance configuration has the required JVM argument.
+     * Reads the instance.cfg file from the instance root and looks for the
+     * JvmArgs key to see if it contains the required argument.
+     * 
+     * @param instanceRoot The Prism/MultiMC instance root directory
+     * @return true if the argument is present or check can't be performed, false if missing
+     */
+    private static boolean hasRequiredJvmArg(Path instanceRoot) {
+        if (instanceRoot == null) {
+            return true; // Can't check, don't show popup
+        }
+        
+        Path instanceCfg = instanceRoot.resolve("instance.cfg");
+        if (!Files.isRegularFile(instanceCfg)) {
+            return true; // No config file, can't check
+        }
+        
+        try {
+            List<String> lines = Files.readAllLines(instanceCfg, StandardCharsets.UTF_8);
+            for (String line : lines) {
+                // Look for JvmArgs= or OverrideJavaArgs= lines
+                if (line.startsWith("JvmArgs=") || line.startsWith("OverrideJavaArgs=")) {
+                    // Check if the required arg is in the value
+                    if (line.contains(REQUIRED_JVM_ARG)) {
+                        return true;
+                    }
+                }
+            }
+            // If we found JvmArgs but it doesn't contain our arg, we need to warn
+            // Also check if OverrideJavaArgs is enabled (meaning they have custom args)
+            boolean hasCustomArgs = false;
+            for (String line : lines) {
+                if (line.startsWith("OverrideJavaArgs=true")) {
+                    hasCustomArgs = true;
+                    break;
+                }
+            }
+            // Only warn if they have custom args but not our required one
+            if (hasCustomArgs) {
+                return false;
+            }
+            return true; // No custom args, default behavior
+        } catch (IOException ex) {
+            System.err.println("[mod-updater] Failed to read instance.cfg: " + ex.getMessage());
+            return true; // Can't read, don't show popup
+        }
+    }
+
+    /**
+     * Shows a warning popup if the required JVM argument is missing from the instance config.
+     * Only shown on macOS where this argument is needed.
+     * 
+     * @param parent The parent component for the dialog
+     * @param instanceRoot The Prism/MultiMC instance root directory
+     */
+    private static void checkAndWarnJvmArg(Component parent, Path instanceRoot) {
+        // Only check on macOS
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("mac")) {
+            return;
+        }
+        
+        if (!hasRequiredJvmArg(instanceRoot)) {
+            SwingUtilities.invokeLater(new Runnable() {
+                public void run() {
+                    JOptionPane.showMessageDialog(parent,
+                            "For optimal performance on macOS, it is recommended to add the following\n" +
+                            "JVM argument to your instance's Java settings:\n\n" +
+                            REQUIRED_JVM_ARG + "\n\n" +
+                            "In Prism Launcher: Edit Instance → Settings → Java → Java arguments",
+                            "Recommended JVM Argument",
+                            JOptionPane.INFORMATION_MESSAGE);
+                }
+            });
+        }
     }
 
     private static void ensureDir(Path dir) throws IOException {
