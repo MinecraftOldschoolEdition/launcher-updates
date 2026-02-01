@@ -1920,11 +1920,11 @@ public final class ModUpdaterGUI {
                     if (slashIdx < 0) continue;
                     String relativePath = name.substring(slashIdx + 1);
                     
-                    // Only extract files under assets/
+                    // Extract files under assets/ (fonts are now in assets/minecraft/font/)
                     if (!relativePath.startsWith("assets/")) continue;
                     if (entry.isDirectory()) continue;
                     
-                    // Target path: resources/assets/...
+                    // Target path: resources/...
                     Path dest = resourcesDir.resolve(relativePath);
                     ensureDir(dest.getParent());
                     
