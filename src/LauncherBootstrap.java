@@ -65,8 +65,12 @@ public final class LauncherBootstrap {
             pb.environment().put("_JAVA_AWT_WM_NONREPARENTING", "1");
 
             System.out.println("[Launcher] Relaunching with GDK_BACKEND=x11 for Steam Deck compatibility...");
-            pb.start();
-            return true; // Signal to exit current process
+            Process p = pb.start();
+            // Wait for the child process to complete before exiting
+            // This ensures Prism Launcher waits for the updater to finish
+            int exitCode = p.waitFor();
+            System.exit(exitCode);
+            return true; // Never reached, but keeps compiler happy
         } catch (Exception e) {
             System.err.println("[Launcher] Failed to relaunch: " + e.getMessage());
             return false;
