@@ -197,6 +197,18 @@ public final class ModUpdaterGUI {
     /** HTTP connection and read timeout in milliseconds (15 seconds) */
     private static final int HTTP_TIMEOUT_MS = 15000;
     
+    /** Resource archive download timeout in milliseconds (45 seconds). */
+    private static final int RESOURCE_ARCHIVE_TIMEOUT_MS = 45000;
+    
+    /** Number of attempts per resource archive candidate URL. */
+    private static final int RESOURCE_ARCHIVE_RETRIES = 3;
+    
+    /** Base delay for resource archive retry backoff. */
+    private static final long RESOURCE_ARCHIVE_RETRY_BASE_DELAY_MS = 750L;
+    
+    /** Maximum per-run detailed resource file log lines for each category. */
+    private static final int RESOURCE_SYNC_DETAIL_LOG_LIMIT = 120;
+    
     /** GitHub API endpoint template for fetching the latest release from a repository */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
     
@@ -320,6 +332,7 @@ public final class ModUpdaterGUI {
             
             // Resource pack repository (assets synced before each launch)
             String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
+            String resourcePackBranch = value(cli, cfg, "resourcePackBranch", "main");
 
             // =================================================================
             // STEP 4: Resolve Directory Paths
@@ -385,6 +398,7 @@ public final class ModUpdaterGUI {
             state.launcherUpdate = checkLauncherUpdate(launcherRepo, launcherJarRegex, launcherJarPath, instanceRoot);
             state.branch = branch;                         // Current branch context
             state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
+            state.resourcePackBranch = resourcePackBranch; // Resource pack branch
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             
             // Display the launcher GUI (blocks until user closes it)
@@ -455,6 +469,7 @@ public final class ModUpdaterGUI {
         sb.append("minecraftDir=../../minecraft/game").append(newline);
         sb.append("newsUrl=https://minecraftoldschool.com/updates.html").append(newline);
         sb.append("resourcePackRepo=MinecraftOldschoolEdition/resourcepack").append(newline);
+        sb.append("resourcePackBranch=main").append(newline);
         Files.write(configPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -580,6 +595,7 @@ public final class ModUpdaterGUI {
         LauncherUpdateState launcherUpdate;
         Path instanceRoot;
         String resourcePackRepo;
+        String resourcePackBranch;
         Path minecraftDir;
     }
 
@@ -598,6 +614,88 @@ public final class ModUpdaterGUI {
         ReleaseAsset asset;
         Path launcherJar;
         String currentVersion;
+    }
+    
+    private enum ResourceSyncMode {
+        SMART,
+        FULL
+    }
+    
+    private static final class ResourceArchiveCandidate {
+        final String url;
+        final String branch;
+        
+        ResourceArchiveCandidate(String url, String branch) {
+            this.url = url;
+            this.branch = branch;
+        }
+    }
+    
+    private static final class ResourceArchiveDownload {
+        final Path zipPath;
+        final String url;
+        final String branch;
+        
+        ResourceArchiveDownload(Path zipPath, String url, String branch) {
+            this.zipPath = zipPath;
+            this.url = url;
+            this.branch = branch;
+        }
+    }
+    
+    private static final class ResourceSyncResult {
+        boolean success;
+        String sourceUrl;
+        String sourceBranch;
+        ResourceSyncMode mode;
+        int copiedFiles;
+        int langFilesRefreshed;
+        int missingFilesCopied;
+        int skippedExistingFiles;
+        final List<String> missingAssetDetails = new ArrayList<String>();
+        final List<String> refreshedLanguageDetails = new ArrayList<String>();
+        int suppressedMissingDetails;
+        int suppressedLanguageDetails;
+        final List<String> attempts = new ArrayList<String>();
+        final List<String> errors = new ArrayList<String>();
+        
+        void addMissingAssetDetail(String path) {
+            if (path == null) return;
+            if (missingAssetDetails.size() < RESOURCE_SYNC_DETAIL_LOG_LIMIT) {
+                missingAssetDetails.add(path);
+            } else {
+                suppressedMissingDetails++;
+            }
+        }
+        
+        void addRefreshedLanguageDetail(String path) {
+            if (path == null) return;
+            if (refreshedLanguageDetails.size() < RESOURCE_SYNC_DETAIL_LOG_LIMIT) {
+                refreshedLanguageDetails.add(path);
+            } else {
+                suppressedLanguageDetails++;
+            }
+        }
+        
+        String describeFailure() {
+            StringBuilder sb = new StringBuilder();
+            if (!attempts.isEmpty()) {
+                sb.append("Attempts: ");
+                for (int i = 0; i < attempts.size(); i++) {
+                    if (i > 0) sb.append(" | ");
+                    sb.append(attempts.get(i));
+                }
+            }
+            if (!errors.isEmpty()) {
+                if (sb.length() > 0) sb.append(" | ");
+                sb.append("Errors: ");
+                for (int i = 0; i < errors.size(); i++) {
+                    if (i > 0) sb.append(" | ");
+                    sb.append(errors.get(i));
+                }
+            }
+            return sb.toString();
+        }
     }
 
     private static void saveBetaSetting(Path configPath, boolean useBeta) {
@@ -1239,7 +1337,13 @@ public final class ModUpdaterGUI {
                                     if (launcherState != null && launcherState.resourcePackRepo != null) {
                                         ui.setPhaseText("Syncing resource pack...");
                                         ui.progress(10);
-                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                        ResourceSyncResult syncResult = syncResourcePack(
+                                                launcherState.resourcePackRepo,
+                                                launcherState.resourcePackBranch,
+                                                launcherState.minecraftDir,
+                                                ResourceSyncMode.SMART,
+                                                false);
+                                        logResourceSyncResult(syncResult);
                                     }
                                     // Install macOS patches if needed
                                     if (launcherState != null) {
@@ -1307,10 +1411,20 @@ public final class ModUpdaterGUI {
 
                                     runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.assetsZip, ctx.latest, jarmodName);
                                     
+                                    boolean forceResync = launcherState != null && launcherState.forceUpdate;
+                                    ResourceSyncMode syncMode = forceResync ? ResourceSyncMode.FULL : ResourceSyncMode.SMART;
+                                    boolean strictSync = forceResync;
+                                    
                                     // Sync resource pack before launching
-                                    ui.setPhaseText("Syncing resource pack...");
+                                    ui.setPhaseText(forceResync ? "Force-syncing resource pack..." : "Syncing resource pack...");
                                     if (launcherState != null) {
-                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                        ResourceSyncResult syncResult = syncResourcePack(
+                                                launcherState.resourcePackRepo,
+                                                launcherState.resourcePackBranch,
+                                                launcherState.minecraftDir,
+                                                syncMode,
+                                                strictSync);
+                                        logResourceSyncResult(syncResult);
                                         // Install macOS patches if needed
                                         installMacOSPatch(launcherState.instanceRoot);
                                         installNetMinecraftJsonPatch(launcherState.instanceRoot);
@@ -1347,7 +1461,13 @@ public final class ModUpdaterGUI {
                                     if (launcherState != null && launcherState.resourcePackRepo != null) {
                                         ui.setPhaseText("Syncing resource pack...");
                                         ui.progress(10);
-                                        syncResourcePack(launcherState.resourcePackRepo, launcherState.minecraftDir);
+                                        ResourceSyncResult syncResult = syncResourcePack(
+                                                launcherState.resourcePackRepo,
+                                                launcherState.resourcePackBranch,
+                                                launcherState.minecraftDir,
+                                                ResourceSyncMode.SMART,
+                                                false);
+                                        logResourceSyncResult(syncResult);
                                     }
                                     // Install macOS patches if needed
                                     if (launcherState != null) {
@@ -1857,102 +1977,383 @@ public final class ModUpdaterGUI {
     }
     
     /**
-     * Syncs the resource pack from a GitHub repository before launching the game.
-     * Downloads the repository's main branch as a zipball and extracts the assets/
-     * folder to the Minecraft resources directory.
+     * Syncs the resource pack from a repository using either smart or full mode.
      *
-     * @param repo        GitHub repository in "owner/repo" format
+     * Smart mode:
+     * - Always refreshes files under assets/minecraft/lang/
+     * - Copies all other assets only when they are missing locally
+     *
+     * Full mode:
+     * - Replaces every asset file from the archive
+     *
+     * @param repo GitHub repository in owner/repo format
+     * @param branch Preferred branch (defaults to main when missing)
      * @param minecraftDir Path to the .minecraft directory
+     * @param mode Smart or full resource sync mode
+     * @param strict Whether sync failure should abort launch
+     * @return Sync result containing counts and attempted URLs
+     * @throws IOException when strict mode is enabled and sync fails
      */
-    private static void syncResourcePack(String repo, Path minecraftDir) {
-        if (repo == null || repo.isEmpty() || minecraftDir == null) {
-            return;
+    private static ResourceSyncResult syncResourcePack(String repo, String branch, Path minecraftDir, ResourceSyncMode mode, boolean strict) throws IOException {
+        ResourceSyncResult result = new ResourceSyncResult();
+        result.mode = mode != null ? mode : ResourceSyncMode.SMART;
+        
+        if (repo == null || repo.trim().isEmpty()) {
+            if (strict) {
+                System.err.println("[mod-updater] Resource sync: missing resourcePackRepo; strict mode requires a full sync.");
+                throw new IOException("Resource pack repository is not configured.");
+            }
+            System.err.println("[mod-updater] Resource sync skipped: resourcePackRepo is not configured.");
+            result.success = true;
+            return result;
+        }
+        if (minecraftDir == null) {
+            if (strict) {
+                System.err.println("[mod-updater] Resource sync: missing minecraftDir; strict mode requires a full sync.");
+                throw new IOException("Minecraft directory is not available for resource sync.");
+            }
+            System.err.println("[mod-updater] Resource sync skipped: minecraftDir is unavailable.");
+            result.success = true;
+            return result;
         }
         
-        System.out.println("[mod-updater] Syncing resource pack from: " + repo);
+        String repoTrimmed = repo.trim();
+        String effectiveBranch = normalizeResourcePackBranch(branch);
+        System.out.println("[mod-updater] Syncing resource pack from: " + repoTrimmed + " (branch=" + effectiveBranch + ", mode=" + result.mode + ")");
+        if (result.mode == ResourceSyncMode.SMART) {
+            System.out.println("[mod-updater] Smart sync policy: refresh language files and restore only missing non-language assets.");
+        } else {
+            System.out.println("[mod-updater] Full sync policy: re-download and replace all resource-pack assets.");
+        }
         
+        ResourceArchiveDownload archive = null;
         try {
-            // Download the repository as a zipball from the main branch
-            String zipUrl = "https://github.com/" + repo + "/archive/refs/heads/main.zip";
-            String tmpDir = System.getProperty("java.io.tmpdir");
-            Path zipPath = Paths.get(tmpDir, "resourcepack-" + System.currentTimeMillis() + ".zip");
-            
-            URL url = new URL(zipUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            conn.setReadTimeout(HTTP_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
-            conn.setInstanceFollowRedirects(true);
-            
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                System.err.println("[mod-updater] Failed to download resource pack: HTTP " + code);
-                return;
-            }
-            
-            // Download the zip file
-            InputStream in = new BufferedInputStream(conn.getInputStream());
-            FileOutputStream out = new FileOutputStream(zipPath.toFile());
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            try {
-                while ((n = in.read(buf)) != -1) {
-                    out.write(buf, 0, n);
+            archive = downloadResourcePackArchive(repoTrimmed, effectiveBranch, result);
+            if (archive == null || archive.zipPath == null) {
+                String detail = result.describeFailure();
+                String msg = "Failed to download resource pack archive.";
+                if (strict) {
+                    throw new IOException(msg + (detail.length() > 0 ? " " + detail : ""));
                 }
-            } finally {
-                try { in.close(); } catch (IOException ignored) {}
-                try { out.close(); } catch (IOException ignored) {}
+                System.err.println("[mod-updater] Warning: " + msg + (detail.length() > 0 ? " " + detail : ""));
+                return result;
             }
             
-            // Extract assets/ folder to resources/
-            Path resourcesDir = minecraftDir.resolve("resources");
-            ensureDir(resourcesDir);
-            
-            ZipInputStream zis = new ZipInputStream(new FileInputStream(zipPath.toFile()));
-            ZipEntry entry;
-            int extractedCount = 0;
-            try {
-                while ((entry = zis.getNextEntry()) != null) {
-                    String name = entry.getName().replace('\\', '/');
-                    
-                    // Skip the root folder (e.g., "resourcepack-main/")
-                    int slashIdx = name.indexOf('/');
-                    if (slashIdx < 0) continue;
-                    String relativePath = name.substring(slashIdx + 1);
-                    
-                    // Extract files under assets/ (fonts are now in assets/minecraft/font/)
-                    if (!relativePath.startsWith("assets/")) continue;
-                    if (entry.isDirectory()) continue;
-                    
-                    // Target path: resources/...
-                    Path dest = resourcesDir.resolve(relativePath);
-                    ensureDir(dest.getParent());
-                    
-                    FileOutputStream fos = new FileOutputStream(dest.toFile());
-                    try {
-                        while ((n = zis.read(buf)) != -1) {
-                            fos.write(buf, 0, n);
-                        }
-                        extractedCount++;
-                    } finally {
-                        try { fos.close(); } catch (IOException ignored) {}
+            result.sourceUrl = archive.url;
+            result.sourceBranch = archive.branch;
+            System.out.println("[mod-updater] Resource sync: downloaded archive from " + archive.url + " (branch=" + archive.branch + "), applying fixes...");
+            extractResourcePackArchive(archive.zipPath, minecraftDir, result.mode, result);
+            result.success = true;
+            return result;
+        } catch (IOException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            result.errors.add(msg);
+            if (strict) {
+                String detail = result.describeFailure();
+                throw new IOException("Resource pack sync failed in strict mode: " + msg + (detail.length() > 0 ? " | " + detail : ""), e);
+            }
+            System.err.println("[mod-updater] Warning: Failed to sync resource pack: " + msg);
+            return result;
+        } finally {
+            if (archive != null && archive.zipPath != null) {
+                try { Files.deleteIfExists(archive.zipPath); } catch (IOException ignored) {}
+            }
+        }
+    }
+    
+    private static void logResourceSyncResult(ResourceSyncResult result) {
+        if (result == null) return;
+        if (result.success) {
+            System.out.println("[mod-updater] Resource pack sync complete (" + result.mode + "): copied="
+                    + result.copiedFiles
+                    + ", langRefreshed=" + result.langFilesRefreshed
+                    + ", missingCopied=" + result.missingFilesCopied
+                    + ", skippedExisting=" + result.skippedExistingFiles
+                    + ", sourceBranch=" + (result.sourceBranch != null ? result.sourceBranch : "?")
+                    + ", sourceUrl=" + (result.sourceUrl != null ? result.sourceUrl : "?"));
+            if (!result.missingAssetDetails.isEmpty()) {
+                for (int i = 0; i < result.missingAssetDetails.size(); i++) {
+                    System.out.println("[mod-updater] Missing asset detected and restored: " + result.missingAssetDetails.get(i));
+                }
+            }
+            if (result.suppressedMissingDetails > 0) {
+                System.out.println("[mod-updater] Missing asset restore logs truncated: +" + result.suppressedMissingDetails + " more files.");
+            }
+            if (!result.refreshedLanguageDetails.isEmpty()) {
+                for (int i = 0; i < result.refreshedLanguageDetails.size(); i++) {
+                    System.out.println("[mod-updater] Language file refreshed: " + result.refreshedLanguageDetails.get(i));
+                }
+            }
+            if (result.suppressedLanguageDetails > 0) {
+                System.out.println("[mod-updater] Language refresh logs truncated: +" + result.suppressedLanguageDetails + " more files.");
+            }
+        } else {
+            String detail = result.describeFailure();
+            if (detail != null && detail.length() > 0) {
+                System.err.println("[mod-updater] Resource pack sync incomplete: " + detail);
+            }
+        }
+    }
+    
+    private static ResourceArchiveDownload downloadResourcePackArchive(String repo, String branch, ResourceSyncResult result) {
+        List<ResourceArchiveCandidate> candidates = buildResourceArchiveCandidates(repo, branch);
+        if (candidates.isEmpty()) {
+            System.err.println("[mod-updater] Resource sync: no archive candidates were generated.");
+            return null;
+        }
+        System.out.println("[mod-updater] Resource sync: will try " + candidates.size() + " archive source candidate(s).");
+        for (ResourceArchiveCandidate candidate : candidates) {
+            for (int attempt = 1; attempt <= RESOURCE_ARCHIVE_RETRIES; attempt++) {
+                Path downloaded = null;
+                String label = candidate.url + " [branch=" + candidate.branch + ", try=" + attempt + "/" + RESOURCE_ARCHIVE_RETRIES + "]";
+                System.out.println("[mod-updater] Resource sync: trying source " + label);
+                try {
+                    downloaded = downloadUrlToTempWithTimeout(
+                            candidate.url,
+                            "resourcepack-" + sanitizeTempName(repo) + "-" + sanitizeTempName(candidate.branch) + "-" + System.currentTimeMillis() + "-" + attempt + ".zip",
+                            RESOURCE_ARCHIVE_TIMEOUT_MS);
+                    if (!isValidZipArchive(downloaded)) {
+                        throw new IOException("Downloaded file is not a valid ZIP archive.");
                     }
-                    
-                    zis.closeEntry();
+                    result.attempts.add(label + " -> OK");
+                    return new ResourceArchiveDownload(downloaded, candidate.url, candidate.branch);
+                } catch (IOException ex) {
+                    String err = ex.getMessage() != null ? ex.getMessage() : ex.toString();
+                    result.attempts.add(label + " -> FAIL: " + err);
+                    result.errors.add(label + " -> " + err);
+                    if (attempt < RESOURCE_ARCHIVE_RETRIES) {
+                        System.err.println("[mod-updater] Resource sync: source failed (" + err + "). Retrying same source...");
+                    } else {
+                        System.err.println("[mod-updater] Resource sync: source exhausted (" + err + "). Moving to next fallback source...");
+                    }
+                    if (downloaded != null) {
+                        try { Files.deleteIfExists(downloaded); } catch (IOException ignored) {}
+                    }
+                    if (attempt < RESOURCE_ARCHIVE_RETRIES) {
+                        sleepQuietly(RESOURCE_ARCHIVE_RETRY_BASE_DELAY_MS * attempt);
+                    }
                 }
-            } finally {
-                try { zis.close(); } catch (IOException ignored) {}
             }
-            
-            // Clean up the downloaded zip
-            Files.deleteIfExists(zipPath);
-            
-            System.out.println("[mod-updater] Resource pack synced: " + extractedCount + " files extracted to " + resourcesDir);
-            
-        } catch (Exception e) {
-            // Don't fail the launch if resource pack sync fails
-            System.err.println("[mod-updater] Warning: Failed to sync resource pack: " + e.getMessage());
-            e.printStackTrace();
+        }
+        return null;
+    }
+    
+    private static List<ResourceArchiveCandidate> buildResourceArchiveCandidates(String repo, String preferredBranch) {
+        String branch = normalizeResourcePackBranch(preferredBranch);
+        List<String> branches = new ArrayList<String>();
+        branches.add(branch);
+        if ("main".equalsIgnoreCase(branch)) {
+            branches.add("master");
+        }
+        
+        List<ResourceArchiveCandidate> urls = new ArrayList<ResourceArchiveCandidate>();
+        for (String b : branches) {
+            urls.add(new ResourceArchiveCandidate("https://github.com/" + repo + "/archive/refs/heads/" + b + ".zip", b));
+            urls.add(new ResourceArchiveCandidate("https://codeload.github.com/" + repo + "/zip/refs/heads/" + b, b));
+        }
+        
+        // Fallback mirror after all GitHub endpoints
+        for (String b : branches) {
+            urls.add(new ResourceArchiveCandidate("https://cdn.jsdelivr.net/gh/" + repo + "@" + b + "/.zip", b));
+        }
+        return urls;
+    }
+    
+    private static String normalizeResourcePackBranch(String branch) {
+        if (branch == null) return "main";
+        String trimmed = branch.trim();
+        return trimmed.length() > 0 ? trimmed : "main";
+    }
+    
+    private static void extractResourcePackArchive(Path zipPath, Path minecraftDir, ResourceSyncMode mode, ResourceSyncResult result) throws IOException {
+        Path resourcesDir = minecraftDir.resolve("resources").normalize();
+        Path assetsRoot = resourcesDir.resolve("assets").normalize();
+        ensureDir(assetsRoot);
+        
+        byte[] buf = new byte[64 * 1024];
+        ZipInputStream zis = new ZipInputStream(new BufferedInputStream(new FileInputStream(zipPath.toFile())));
+        try {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                String name = entry.getName().replace('\\', '/');
+                int slashIdx = name.indexOf('/');
+                if (slashIdx < 0 || slashIdx + 1 >= name.length()) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                String relativePath = name.substring(slashIdx + 1);
+                if (!relativePath.startsWith("assets/")) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                Path rel;
+                try {
+                    rel = Paths.get(relativePath).normalize();
+                } catch (InvalidPathException badPath) {
+                    zis.closeEntry();
+                    continue;
+                }
+                if (rel.isAbsolute()) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                String relNorm = rel.toString().replace('\\', '/');
+                if (relNorm.startsWith("..")) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                Path dest = resourcesDir.resolve(rel).normalize();
+                if (!dest.startsWith(resourcesDir)) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                boolean isLangFile = isLanguageAssetPath(relNorm);
+                boolean shouldCopy;
+                boolean replaceExisting = false;
+                if (mode == ResourceSyncMode.FULL) {
+                    shouldCopy = true;
+                    replaceExisting = true;
+                } else if (isLangFile) {
+                    shouldCopy = true;
+                    replaceExisting = true;
+                } else if (Files.exists(dest)) {
+                    shouldCopy = false;
+                    result.skippedExistingFiles++;
+                } else {
+                    shouldCopy = true;
+                }
+                
+                if (!shouldCopy) {
+                    zis.closeEntry();
+                    continue;
+                }
+                
+                boolean existedBefore = Files.exists(dest);
+                byte[] previousLangBytes = null;
+                if (isLangFile && existedBefore) {
+                    try {
+                        previousLangBytes = Files.readAllBytes(dest);
+                    } catch (IOException ignored) {}
+                }
+                
+                ensureDir(dest.getParent());
+                try {
+                    if (replaceExisting) {
+                        Files.copy(zis, dest, StandardCopyOption.REPLACE_EXISTING);
+                    } else {
+                        Files.copy(zis, dest);
+                    }
+                    result.copiedFiles++;
+                    if (isLangFile) {
+                        result.langFilesRefreshed++;
+                        result.addRefreshedLanguageDetail(relNorm);
+                        if (existedBefore) {
+                            boolean changed = true;
+                            try {
+                                byte[] currentBytes = Files.readAllBytes(dest);
+                                if (previousLangBytes != null) {
+                                    changed = !Arrays.equals(previousLangBytes, currentBytes);
+                                }
+                            } catch (IOException ignored) {}
+                            if (changed) {
+                                System.out.println("[mod-updater] Language overwrite applied (updated content): " + relNorm);
+                            } else {
+                                System.out.println("[mod-updater] Language overwrite applied (content unchanged): " + relNorm);
+                            }
+                        } else {
+                            System.out.println("[mod-updater] Language file missing; installed latest version: " + relNorm);
+                        }
+                    } else if (mode == ResourceSyncMode.SMART) {
+                        result.missingFilesCopied++;
+                        result.addMissingAssetDetail(relNorm);
+                    }
+                } catch (FileAlreadyExistsException alreadyExists) {
+                    result.skippedExistingFiles++;
+                }
+                zis.closeEntry();
+            }
+        } finally {
+            try { zis.close(); } catch (IOException ignored) {}
+        }
+    }
+    
+    private static boolean isLanguageAssetPath(String relativePath) {
+        if (relativePath == null) return false;
+        String norm = relativePath.replace('\\', '/').toLowerCase(Locale.ROOT);
+        return norm.startsWith("assets/minecraft/lang/") && !norm.endsWith("/");
+    }
+    
+    private static String sanitizeTempName(String name) {
+        if (name == null || name.isEmpty()) return "unknown";
+        return name.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+    
+    private static Path downloadUrlToTempWithTimeout(String url, String suggestedName, int timeoutMs) throws IOException {
+        String tmpDir = System.getProperty("java.io.tmpdir");
+        Path tmp = Paths.get(tmpDir, suggestedName);
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setUseCaches(false);
+        conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+        conn.setRequestProperty("Cache-Control", "no-cache, no-store, max-age=0");
+        conn.setRequestProperty("Pragma", "no-cache");
+        conn.setInstanceFollowRedirects(true);
+        
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            InputStream err = conn.getErrorStream();
+            String body = err != null ? readAll(err) : "";
+            throw new IOException("HTTP " + code + " " + truncateErrorBody(body));
+        }
+        
+        InputStream in = new BufferedInputStream(conn.getInputStream());
+        FileOutputStream out = new FileOutputStream(tmp.toFile());
+        byte[] buf = new byte[64 * 1024];
+        int n;
+        try {
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+            }
+        } finally {
+            try { in.close(); } catch (IOException ignored) {}
+            try { out.close(); } catch (IOException ignored) {}
+        }
+        return tmp;
+    }
+    
+    private static boolean isValidZipArchive(Path zipPath) {
+        if (zipPath == null || !Files.isRegularFile(zipPath)) return false;
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(zipPath.toFile());
+            zip.entries();
+            return true;
+        } catch (IOException ignored) {
+            return false;
+        } finally {
+            if (zip != null) {
+                try { zip.close(); } catch (IOException ignored) {}
+            }
+        }
+    }
+    
+    private static void sleepQuietly(long millis) {
+        if (millis <= 0) return;
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
         }
     }
     
