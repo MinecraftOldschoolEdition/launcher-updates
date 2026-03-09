@@ -5,6 +5,15 @@
 // Swing GUI components
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.text.EditorKit;
+import javax.swing.text.html.HTMLDocument;
+import javax.swing.text.html.HTMLEditorKit;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 // AWT graphics and windowing
 import java.awt.*;
@@ -21,6 +30,14 @@ import java.net.ProtocolException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 
 // Collections and utilities
 import java.util.List;
@@ -211,6 +228,21 @@ public final class ModUpdaterGUI {
     
     /** GitHub API endpoint template for fetching the latest release from a repository */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
+    
+    /**
+     * OS trust bundle paths used to supplement outdated Java truststores.
+     * These are best-effort fallbacks and are ignored when missing.
+     */
+    private static final String[] OS_CA_BUNDLE_PATHS = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem"
+    };
+    
+    /** Lazy-initialized TLS socket factory that merges Java and OS trust roots. */
+    private static volatile SSLSocketFactory TLS_SOCKET_FACTORY;
+    private static volatile boolean TLS_SOCKET_FACTORY_INIT_FAILED;
+    private static final Object TLS_SOCKET_FACTORY_LOCK = new Object();
     
     // =========================================================================
     // CONSTANTS - UI Fonts and Textures
@@ -838,10 +870,7 @@ public final class ModUpdaterGUI {
     }
 
     private static Long fetchRemoteContentLength(String url) throws IOException {
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
-        conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
         try {
             conn.setRequestMethod("HEAD");
         } catch (ProtocolException ignored) {}
@@ -998,6 +1027,97 @@ public final class ModUpdaterGUI {
 
     private static LatestRelease currentLatest(LauncherState state) {
         return state != null && state.branch != null ? state.branch.latest : null;
+    }
+    
+    /**
+     * Loads news HTML into the embedded pane using the updater's TLS-compatible
+     * HTTP client, then falls back to release notes if loading fails.
+     */
+    private static void loadNewsPage(final JEditorPane newsPane, final String newsUrl, final LatestRelease fallbackLatest) {
+        if (newsPane == null) return;
+        
+        String url = newsUrl != null ? newsUrl.trim() : "";
+        if (url.isEmpty()) {
+            setNewsHtml(newsPane, buildReleaseHtml(fallbackLatest, null), null);
+            newsPane.setCaretPosition(0);
+            return;
+        }
+        
+        setNewsHtml(newsPane, "<html><body style='background:#101010;color:#d0d0d0;font-family:sans-serif;'>Loading news...</body></html>", null);
+        newsPane.setCaretPosition(0);
+        
+        final String targetUrl = url;
+        Thread loader = new Thread(new Runnable() {
+            public void run() {
+                String html;
+                URL baseUrl = null;
+                Exception loadError = null;
+                try {
+                    NewsPage page = fetchNewsPage(targetUrl);
+                    html = page.html;
+                    baseUrl = page.baseUrl;
+                    if (html == null || html.trim().isEmpty()) {
+                        throw new IOException("News page returned empty content.");
+                    }
+                } catch (Exception ex) {
+                    loadError = ex;
+                    html = buildReleaseHtml(fallbackLatest, ex);
+                }
+                
+                final String finalHtml = html;
+                final URL finalBaseUrl = baseUrl;
+                final Exception finalLoadError = loadError;
+                SwingUtilities.invokeLater(new Runnable() {
+                    public void run() {
+                        setNewsHtml(newsPane, finalHtml, finalBaseUrl);
+                        newsPane.setCaretPosition(0);
+                        if (finalLoadError != null) {
+                            System.err.println("[mod-updater] News load failed for " + targetUrl + ": " + finalLoadError.getMessage());
+                        }
+                    }
+                });
+            }
+        }, "ModUpdater-NewsLoad");
+        loader.setDaemon(true);
+        loader.start();
+    }
+    
+    private static NewsPage fetchNewsPage(String newsUrl) throws IOException {
+        HttpURLConnection conn = openHttpConnection(newsUrl, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+        conn.setRequestMethod("GET");
+        conn.setUseCaches(false);
+        conn.setInstanceFollowRedirects(true);
+        conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8");
+        
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            InputStream err = conn.getErrorStream();
+            String body = err != null ? readAll(err) : "";
+            throw new IOException("News page HTTP " + code + " " + truncateErrorBody(body));
+        }
+        
+        String html = readAll(conn.getInputStream());
+        return new NewsPage(html, conn.getURL());
+    }
+    
+    private static void setNewsHtml(JEditorPane newsPane, String html, URL baseUrl) {
+        String safeHtml = html != null ? html : "";
+        try {
+            EditorKit kit = newsPane.getEditorKit();
+            if (kit instanceof HTMLEditorKit) {
+                HTMLEditorKit htmlKit = (HTMLEditorKit) kit;
+                HTMLDocument doc = (HTMLDocument) htmlKit.createDefaultDocument();
+                if (baseUrl != null) {
+                    doc.setBase(baseUrl);
+                }
+                newsPane.setDocument(doc);
+                htmlKit.read(new StringReader(safeHtml), doc, 0);
+            } else {
+                newsPane.setText(safeHtml);
+            }
+        } catch (Exception ignored) {
+            newsPane.setText(safeHtml);
+        }
     }
 
     /**
@@ -1255,16 +1375,7 @@ public final class ModUpdaterGUI {
                 updateLauncherButton.setVisible(hasLauncherUpdate);
 
                 // Load the nested patch notes "web page"
-                try {
-                    if (newsUrl != null && newsUrl.trim().length() > 0) {
-                        newsPane.setPage(newsUrl);
-                    } else {
-                        newsPane.setText(buildReleaseHtml(currentLatest(launcherState), null));
-                    }
-                } catch (Exception e) {
-                    newsPane.setText(buildReleaseHtml(currentLatest(launcherState), e));
-                }
-                newsPane.setCaretPosition(0);
+                loadNewsPage(newsPane, newsUrl, currentLatest(launcherState));
                 newsPane.addHyperlinkListener(new javax.swing.event.HyperlinkListener() {
                     public void hyperlinkUpdate(javax.swing.event.HyperlinkEvent e) {
                         if (e.getEventType() == javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
@@ -1286,16 +1397,7 @@ public final class ModUpdaterGUI {
                 newsPane.getActionMap().put("reloadNewsPage", new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
                         System.out.println("[mod-updater] Reloading news page (Ctrl+R)...");
-                        try {
-                            if (newsUrl != null && newsUrl.trim().length() > 0) {
-                                newsPane.setPage(newsUrl);
-                            } else {
-                                newsPane.setText(buildReleaseHtml(currentLatest(launcherState), null));
-                            }
-                        } catch (Exception ex) {
-                            newsPane.setText(buildReleaseHtml(currentLatest(launcherState), ex));
-                        }
-                        newsPane.setCaretPosition(0);
+                        loadNewsPage(newsPane, newsUrl, currentLatest(launcherState));
                     }
                 });
 
@@ -1677,6 +1779,84 @@ public final class ModUpdaterGUI {
             }
         });
         center.add(clearBackupsButton, c);
+        
+        // Fetch Resources row - deletes resources folder and performs a full re-download.
+        c.gridx = 0;
+        c.gridy = 3;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
+        c.insets = new Insets(6, 0, 4, 8);
+        JLabel fetchResourcesLabel = new JLabel("Resources:");
+        center.add(fetchResourcesLabel, c);
+        
+        c.gridx = 1;
+        final JButton fetchResourcesButton = new JButton("Fetch Resources");
+        fetchResourcesButton.addActionListener(new AbstractAction() {
+            public void actionPerformed(ActionEvent e) {
+                if (finalMinecraftDir == null) {
+                    JOptionPane.showMessageDialog(dialog,
+                            "Minecraft directory is unavailable, so resources cannot be fetched.",
+                            "Fetch Resources", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                
+                int confirm = JOptionPane.showConfirmDialog(
+                        dialog,
+                        "This will delete your local resources folder and re-download everything.\nContinue?",
+                        "Fetch Resources",
+                        JOptionPane.YES_NO_OPTION,
+                        JOptionPane.WARNING_MESSAGE);
+                if (confirm != JOptionPane.YES_OPTION) {
+                    return;
+                }
+                
+                final String repo = "MinecraftOldschoolEdition/resourcepack";
+                final String branch = "main";
+                
+                fetchResourcesButton.setEnabled(false);
+                fetchResourcesButton.setText("Fetching...");
+                
+                Thread worker = new Thread(new Runnable() {
+                    public void run() {
+                        try {
+                            Path resourcesDir = finalMinecraftDir.resolve("resources");
+                            deleteDirectoryTree(resourcesDir);
+                            
+                            ResourceSyncResult syncResult = syncResourcePack(
+                                    repo,
+                                    branch,
+                                    finalMinecraftDir,
+                                    ResourceSyncMode.FULL,
+                                    true);
+                            logResourceSyncResult(syncResult);
+                            
+                            SwingUtilities.invokeLater(new Runnable() {
+                                public void run() {
+                                    fetchResourcesButton.setEnabled(true);
+                                    fetchResourcesButton.setText("Fetch Resources");
+                                    JOptionPane.showMessageDialog(
+                                            dialog,
+                                            "Resources were fully re-downloaded from https://github.com/" + repo + ".",
+                                            "Fetch Resources",
+                                            JOptionPane.INFORMATION_MESSAGE);
+                                }
+                            });
+                        } catch (final Throwable ex) {
+                            SwingUtilities.invokeLater(new Runnable() {
+                                public void run() {
+                                    fetchResourcesButton.setEnabled(true);
+                                    fetchResourcesButton.setText("Fetch Resources");
+                                    showError(ex);
+                                }
+                            });
+                        }
+                    }
+                }, "ModUpdater-FetchResources");
+                worker.setDaemon(true);
+                worker.start();
+            }
+        });
+        center.add(fetchResourcesButton, c);
 
         root.add(center, BorderLayout.CENTER);
 
@@ -1758,10 +1938,7 @@ public final class ModUpdaterGUI {
 
                     SwingUtilities.invokeLater(new Runnable() {
                         public void run() {
-                            if (newsUrl == null || newsUrl.trim().isEmpty()) {
-                                newsPane.setText(buildReleaseHtml(ctx.latest, null));
-                                newsPane.setCaretPosition(0);
-                            }
+                            loadNewsPage(newsPane, newsUrl, ctx.latest);
                             playButton.setText("Play");
                             playButton.setEnabled(true);
                         }
@@ -2301,11 +2478,8 @@ public final class ModUpdaterGUI {
     private static Path downloadUrlToTempWithTimeout(String url, String suggestedName, int timeoutMs) throws IOException {
         String tmpDir = System.getProperty("java.io.tmpdir");
         Path tmp = Paths.get(tmpDir, suggestedName);
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(timeoutMs);
-        conn.setReadTimeout(timeoutMs);
+        HttpURLConnection conn = openHttpConnection(url, timeoutMs, timeoutMs, "ModUpdaterGUI/1.0");
         conn.setUseCaches(false);
-        conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
         conn.setRequestProperty("Cache-Control", "no-cache, no-store, max-age=0");
         conn.setRequestProperty("Pragma", "no-cache");
         conn.setInstanceFollowRedirects(true);
@@ -2448,11 +2622,7 @@ public final class ModUpdaterGUI {
             String downloadUrl = "https://github.com/MinecraftOldschoolEdition/net.minecraft.json/releases/download/1.0/net.minecraft.json";
             System.out.println("[mod-updater] Downloading net.minecraft.json from GitHub...");
             
-            URL url = new URL(downloadUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            conn.setReadTimeout(HTTP_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+            HttpURLConnection conn = openHttpConnection(downloadUrl, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
             conn.setInstanceFollowRedirects(true);
             
             int responseCode = conn.getResponseCode();
@@ -2539,11 +2709,7 @@ public final class ModUpdaterGUI {
         try {
             String tmpDir = System.getProperty("java.io.tmpdir");
             Path tmp = Paths.get(tmpDir, filename);
-            URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            conn.setReadTimeout(HTTP_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "ModUpdater/1.0");
+            HttpURLConnection conn = openHttpConnection(urlStr, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdater/1.0");
             int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
                 System.err.println("Download failed: HTTP " + code + " for " + urlStr);
@@ -2794,16 +2960,176 @@ public final class ModUpdaterGUI {
         }
         return false;
     }
+    
+    /**
+     * Opens an HTTP/HTTPS connection with consistent timeout/user-agent settings.
+     * HTTPS connections use a compatibility trust manager that adds OS trust roots.
+     */
+    private static HttpURLConnection openHttpConnection(String url, int connectTimeoutMs, int readTimeoutMs, String userAgent) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
+        if (userAgent != null && !userAgent.isEmpty()) {
+            conn.setRequestProperty("User-Agent", userAgent);
+        }
+        if (conn instanceof HttpsURLConnection) {
+            SSLSocketFactory factory = getTlsSocketFactory();
+            if (factory != null) {
+                ((HttpsURLConnection) conn).setSSLSocketFactory(factory);
+            }
+        }
+        return conn;
+    }
+    
+    private static SSLSocketFactory getTlsSocketFactory() {
+        if (TLS_SOCKET_FACTORY != null || TLS_SOCKET_FACTORY_INIT_FAILED) {
+            return TLS_SOCKET_FACTORY;
+        }
+        synchronized (TLS_SOCKET_FACTORY_LOCK) {
+            if (TLS_SOCKET_FACTORY != null || TLS_SOCKET_FACTORY_INIT_FAILED) {
+                return TLS_SOCKET_FACTORY;
+            }
+            try {
+                List<X509TrustManager> managers = new ArrayList<X509TrustManager>();
+                X509TrustManager defaultManager = loadDefaultTrustManager();
+                if (defaultManager != null) {
+                    managers.add(defaultManager);
+                }
+                X509TrustManager windowsManager = loadTrustManagerFromKeyStore("Windows-ROOT");
+                if (windowsManager != null) {
+                    managers.add(windowsManager);
+                }
+                X509TrustManager osBundleManager = loadTrustManagerFromSystemCaBundle();
+                if (osBundleManager != null) {
+                    managers.add(osBundleManager);
+                }
+                if (managers.isEmpty()) {
+                    TLS_SOCKET_FACTORY_INIT_FAILED = true;
+                    return null;
+                }
+                
+                X509TrustManager merged = managers.size() == 1 ? managers.get(0) : mergeTrustManagers(managers);
+                SSLContext ctx = SSLContext.getInstance("TLS");
+                ctx.init(null, new TrustManager[] { merged }, new SecureRandom());
+                TLS_SOCKET_FACTORY = ctx.getSocketFactory();
+                return TLS_SOCKET_FACTORY;
+            } catch (Exception ex) {
+                TLS_SOCKET_FACTORY_INIT_FAILED = true;
+                System.err.println("[mod-updater] TLS compatibility initialization failed; using default JVM trust store only: " + ex.getMessage());
+                return null;
+            }
+        }
+    }
+    
+    private static X509TrustManager loadDefaultTrustManager() throws GeneralSecurityException {
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init((KeyStore) null);
+        return firstX509TrustManager(tmf.getTrustManagers());
+    }
+    
+    private static X509TrustManager loadTrustManagerFromKeyStore(String keyStoreType) {
+        try {
+            KeyStore ks = KeyStore.getInstance(keyStoreType);
+            ks.load(null, null);
+            return loadTrustManager(ks);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    
+    private static X509TrustManager loadTrustManagerFromSystemCaBundle() {
+        for (int i = 0; i < OS_CA_BUNDLE_PATHS.length; i++) {
+            Path bundlePath = Paths.get(OS_CA_BUNDLE_PATHS[i]);
+            if (!Files.isRegularFile(bundlePath)) {
+                continue;
+            }
+            try (InputStream in = Files.newInputStream(bundlePath)) {
+                CertificateFactory cf = CertificateFactory.getInstance("X.509");
+                Collection<? extends Certificate> certs = cf.generateCertificates(in);
+                if (certs == null || certs.isEmpty()) {
+                    continue;
+                }
+                KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                ks.load(null, null);
+                int idx = 0;
+                for (Certificate cert : certs) {
+                    ks.setCertificateEntry("os-ca-" + idx++, cert);
+                }
+                return loadTrustManager(ks);
+            } catch (Exception ignored) {
+                // Try next candidate path.
+            }
+        }
+        return null;
+    }
+    
+    private static X509TrustManager loadTrustManager(KeyStore keyStore) throws GeneralSecurityException {
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(keyStore);
+        return firstX509TrustManager(tmf.getTrustManagers());
+    }
+    
+    private static X509TrustManager firstX509TrustManager(TrustManager[] trustManagers) {
+        if (trustManagers == null) {
+            return null;
+        }
+        for (int i = 0; i < trustManagers.length; i++) {
+            if (trustManagers[i] instanceof X509TrustManager) {
+                return (X509TrustManager) trustManagers[i];
+            }
+        }
+        return null;
+    }
+    
+    private static X509TrustManager mergeTrustManagers(final List<X509TrustManager> managers) {
+        return new X509TrustManager() {
+            public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                CertificateException last = null;
+                for (int i = 0; i < managers.size(); i++) {
+                    try {
+                        managers.get(i).checkClientTrusted(chain, authType);
+                        return;
+                    } catch (CertificateException ex) {
+                        last = ex;
+                    }
+                }
+                if (last != null) throw last;
+                throw new CertificateException("No trust manager accepted the client certificate chain.");
+            }
+            
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                CertificateException last = null;
+                for (int i = 0; i < managers.size(); i++) {
+                    try {
+                        managers.get(i).checkServerTrusted(chain, authType);
+                        return;
+                    } catch (CertificateException ex) {
+                        last = ex;
+                    }
+                }
+                if (last != null) throw last;
+                throw new CertificateException("No trust manager accepted the server certificate chain.");
+            }
+            
+            public X509Certificate[] getAcceptedIssuers() {
+                LinkedHashSet<X509Certificate> issuers = new LinkedHashSet<X509Certificate>();
+                for (int i = 0; i < managers.size(); i++) {
+                    X509Certificate[] certs = managers.get(i).getAcceptedIssuers();
+                    if (certs != null && certs.length > 0) {
+                        issuers.addAll(Arrays.asList(certs));
+                    }
+                }
+                return issuers.toArray(new X509Certificate[issuers.size()]);
+            }
+        };
+    }
 
     private static LatestRelease fetchLatestRelease(String repo) throws IOException {
         // Try /releases/latest first
         String url = String.format(GITHUB_API_LATEST, repo);
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
         conn.setRequestMethod("GET");
         conn.setRequestProperty("Accept", "application/vnd.github+json");
-        conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
         String token = getenv("GITHUB_TOKEN");
         if (token != null && !token.trim().isEmpty()) {
             conn.setRequestProperty("Authorization", "token " + token.trim());
@@ -2815,12 +3141,9 @@ public final class ModUpdaterGUI {
         // If /releases/latest returns 404, fall back to /releases and pick the first one
         if (code == 404) {
             String fallbackUrl = "https://api.github.com/repos/" + repo + "/releases";
-            HttpURLConnection fallbackConn = (HttpURLConnection) new URL(fallbackUrl).openConnection();
-            fallbackConn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            fallbackConn.setReadTimeout(HTTP_TIMEOUT_MS);
+            HttpURLConnection fallbackConn = openHttpConnection(fallbackUrl, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
             fallbackConn.setRequestMethod("GET");
             fallbackConn.setRequestProperty("Accept", "application/vnd.github+json");
-            fallbackConn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
             if (token != null && !token.trim().isEmpty()) {
                 fallbackConn.setRequestProperty("Authorization", "token " + token.trim());
             }
@@ -3044,11 +3367,7 @@ public final class ModUpdaterGUI {
     private static Path downloadToTemp(ProgressUI ui, String url, String suggestedName, double start, double end) throws IOException {
         String tmpDir = System.getProperty("java.io.tmpdir");
         Path tmp = Paths.get(tmpDir, suggestedName);
-        URL u = new URL(url);
-        HttpURLConnection conn = (HttpURLConnection) u.openConnection();
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
-        conn.setRequestProperty("User-Agent", "ModUpdaterGUI/1.0");
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
         int code = conn.getResponseCode();
         if (code < 200 || code >= 300) {
             InputStream err = conn.getErrorStream();
@@ -3079,6 +3398,7 @@ public final class ModUpdaterGUI {
     }
 
     private static String readAll(InputStream in) throws IOException {
+        if (in == null) return "";
         BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         char[] buf = new char[8192];
@@ -3134,6 +3454,31 @@ public final class ModUpdaterGUI {
         String stamp = String.valueOf(System.currentTimeMillis());
         Path parent = path.getParent();
         return parent.resolve(name + suffix + "." + stamp);
+    }
+    
+    /**
+     * Deletes a directory tree recursively. Symlinks are deleted as links.
+     */
+    private static void deleteDirectoryTree(Path dir) throws IOException {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+            
+            @Override
+            public FileVisitResult postVisitDirectory(Path directory, IOException exc) throws IOException {
+                if (exc != null) {
+                    throw exc;
+                }
+                Files.deleteIfExists(directory);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     /**
@@ -3585,6 +3930,15 @@ public final class ModUpdaterGUI {
         String htmlUrl;
         String zipballUrl;
         List<ReleaseAsset> assets;
+    }
+    private static final class NewsPage {
+        final String html;
+        final URL baseUrl;
+        
+        NewsPage(String html, URL baseUrl) {
+            this.html = html;
+            this.baseUrl = baseUrl;
+        }
     }
     private static final class ReleaseAsset {
         String name;

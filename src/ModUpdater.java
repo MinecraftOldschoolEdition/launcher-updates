@@ -5,8 +5,18 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +28,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 /**
  * Cross-platform Java CLI updater for Prism/MultiMC Minecraft instances.
@@ -69,6 +85,21 @@ public final class ModUpdater {
     
     /** GitHub API endpoint template for fetching the latest release */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
+    
+    /**
+     * OS trust bundle paths used to supplement outdated Java truststores.
+     * These are best-effort fallbacks and are ignored when missing.
+     */
+    private static final String[] OS_CA_BUNDLE_PATHS = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem"
+    };
+    
+    /** Lazy-initialized TLS socket factory that merges Java and OS trust roots. */
+    private static volatile SSLSocketFactory TLS_SOCKET_FACTORY;
+    private static volatile boolean TLS_SOCKET_FACTORY_INIT_FAILED;
+    private static final Object TLS_SOCKET_FACTORY_LOCK = new Object();
 
     // =========================================================================
     // MAIN ENTRY POINT
@@ -343,6 +374,169 @@ public final class ModUpdater {
         Path parent = path.getParent();
         return parent.resolve(name + suffix + "." + stamp);
     }
+    
+    /**
+     * Opens an HTTP/HTTPS connection with consistent timeout/user-agent settings.
+     * HTTPS connections use a compatibility trust manager that adds OS trust roots.
+     */
+    private static HttpURLConnection openHttpConnection(String url, int connectTimeoutMs, int readTimeoutMs, String userAgent) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
+        if (userAgent != null && !userAgent.isEmpty()) {
+            conn.setRequestProperty("User-Agent", userAgent);
+        }
+        if (conn instanceof HttpsURLConnection) {
+            SSLSocketFactory factory = getTlsSocketFactory();
+            if (factory != null) {
+                ((HttpsURLConnection) conn).setSSLSocketFactory(factory);
+            }
+        }
+        return conn;
+    }
+    
+    private static SSLSocketFactory getTlsSocketFactory() {
+        if (TLS_SOCKET_FACTORY != null || TLS_SOCKET_FACTORY_INIT_FAILED) {
+            return TLS_SOCKET_FACTORY;
+        }
+        synchronized (TLS_SOCKET_FACTORY_LOCK) {
+            if (TLS_SOCKET_FACTORY != null || TLS_SOCKET_FACTORY_INIT_FAILED) {
+                return TLS_SOCKET_FACTORY;
+            }
+            try {
+                List<X509TrustManager> managers = new ArrayList<X509TrustManager>();
+                X509TrustManager defaultManager = loadDefaultTrustManager();
+                if (defaultManager != null) {
+                    managers.add(defaultManager);
+                }
+                X509TrustManager windowsManager = loadTrustManagerFromKeyStore("Windows-ROOT");
+                if (windowsManager != null) {
+                    managers.add(windowsManager);
+                }
+                X509TrustManager osBundleManager = loadTrustManagerFromSystemCaBundle();
+                if (osBundleManager != null) {
+                    managers.add(osBundleManager);
+                }
+                if (managers.isEmpty()) {
+                    TLS_SOCKET_FACTORY_INIT_FAILED = true;
+                    return null;
+                }
+                
+                X509TrustManager merged = managers.size() == 1 ? managers.get(0) : mergeTrustManagers(managers);
+                SSLContext ctx = SSLContext.getInstance("TLS");
+                ctx.init(null, new TrustManager[] { merged }, new SecureRandom());
+                TLS_SOCKET_FACTORY = ctx.getSocketFactory();
+                return TLS_SOCKET_FACTORY;
+            } catch (Exception ex) {
+                TLS_SOCKET_FACTORY_INIT_FAILED = true;
+                logErr("TLS compatibility initialization failed; using default JVM trust store only: " + ex.getMessage());
+                return null;
+            }
+        }
+    }
+    
+    private static X509TrustManager loadDefaultTrustManager() throws GeneralSecurityException {
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init((KeyStore) null);
+        return firstX509TrustManager(tmf.getTrustManagers());
+    }
+    
+    private static X509TrustManager loadTrustManagerFromKeyStore(String keyStoreType) {
+        try {
+            KeyStore ks = KeyStore.getInstance(keyStoreType);
+            ks.load(null, null);
+            return loadTrustManager(ks);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    
+    private static X509TrustManager loadTrustManagerFromSystemCaBundle() {
+        for (int i = 0; i < OS_CA_BUNDLE_PATHS.length; i++) {
+            Path bundlePath = Paths.get(OS_CA_BUNDLE_PATHS[i]);
+            if (!Files.isRegularFile(bundlePath)) {
+                continue;
+            }
+            try (InputStream in = Files.newInputStream(bundlePath)) {
+                CertificateFactory cf = CertificateFactory.getInstance("X.509");
+                Collection<? extends Certificate> certs = cf.generateCertificates(in);
+                if (certs == null || certs.isEmpty()) {
+                    continue;
+                }
+                KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                ks.load(null, null);
+                int idx = 0;
+                for (Certificate cert : certs) {
+                    ks.setCertificateEntry("os-ca-" + idx++, cert);
+                }
+                return loadTrustManager(ks);
+            } catch (Exception ignored) {
+                // Try next candidate path.
+            }
+        }
+        return null;
+    }
+    
+    private static X509TrustManager loadTrustManager(KeyStore keyStore) throws GeneralSecurityException {
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(keyStore);
+        return firstX509TrustManager(tmf.getTrustManagers());
+    }
+    
+    private static X509TrustManager firstX509TrustManager(TrustManager[] trustManagers) {
+        if (trustManagers == null) {
+            return null;
+        }
+        for (int i = 0; i < trustManagers.length; i++) {
+            if (trustManagers[i] instanceof X509TrustManager) {
+                return (X509TrustManager) trustManagers[i];
+            }
+        }
+        return null;
+    }
+    
+    private static X509TrustManager mergeTrustManagers(final List<X509TrustManager> managers) {
+        return new X509TrustManager() {
+            public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                CertificateException last = null;
+                for (int i = 0; i < managers.size(); i++) {
+                    try {
+                        managers.get(i).checkClientTrusted(chain, authType);
+                        return;
+                    } catch (CertificateException ex) {
+                        last = ex;
+                    }
+                }
+                if (last != null) throw last;
+                throw new CertificateException("No trust manager accepted the client certificate chain.");
+            }
+            
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                CertificateException last = null;
+                for (int i = 0; i < managers.size(); i++) {
+                    try {
+                        managers.get(i).checkServerTrusted(chain, authType);
+                        return;
+                    } catch (CertificateException ex) {
+                        last = ex;
+                    }
+                }
+                if (last != null) throw last;
+                throw new CertificateException("No trust manager accepted the server certificate chain.");
+            }
+            
+            public X509Certificate[] getAcceptedIssuers() {
+                LinkedHashSet<X509Certificate> issuers = new LinkedHashSet<X509Certificate>();
+                for (int i = 0; i < managers.size(); i++) {
+                    X509Certificate[] certs = managers.get(i).getAcceptedIssuers();
+                    if (certs != null && certs.length > 0) {
+                        issuers.addAll(Arrays.asList(certs));
+                    }
+                }
+                return issuers.toArray(new X509Certificate[issuers.size()]);
+            }
+        };
+    }
 
     /**
      * Finds an existing file in a directory that matches the given regex.
@@ -406,12 +600,9 @@ public final class ModUpdater {
     private static LatestRelease fetchLatestRelease(String repo) throws IOException {
         // Try /releases/latest endpoint first
         String url = String.format(GITHUB_API_LATEST, repo);
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdater/1.0");
         conn.setRequestMethod("GET");
         conn.setRequestProperty("Accept", "application/vnd.github+json");
-        conn.setRequestProperty("User-Agent", "ModUpdater/1.0");
         
         // Add auth token if available (for higher rate limits)
         String token = getenv("GITHUB_TOKEN");
@@ -426,12 +617,9 @@ public final class ModUpdater {
         // If /releases/latest returns 404, fall back to /releases list
         if (code == 404) {
             String fallbackUrl = "https://api.github.com/repos/" + repo + "/releases";
-            HttpURLConnection fallbackConn = (HttpURLConnection) new URL(fallbackUrl).openConnection();
-            fallbackConn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            fallbackConn.setReadTimeout(HTTP_TIMEOUT_MS);
+            HttpURLConnection fallbackConn = openHttpConnection(fallbackUrl, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdater/1.0");
             fallbackConn.setRequestMethod("GET");
             fallbackConn.setRequestProperty("Accept", "application/vnd.github+json");
-            fallbackConn.setRequestProperty("User-Agent", "ModUpdater/1.0");
             if (token != null && !token.trim().isEmpty()) {
                 fallbackConn.setRequestProperty("Authorization", "token " + token.trim());
             }
@@ -495,6 +683,7 @@ public final class ModUpdater {
      * @return Complete content as a string
      */
     private static String readAll(InputStream in) throws IOException {
+        if (in == null) return "";
         BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         char[] buf = new char[8192];
@@ -678,11 +867,7 @@ public final class ModUpdater {
         String tmpDir = System.getProperty("java.io.tmpdir");
         Path tmp = Paths.get(tmpDir, suggestedName);
         
-        URL u = new URL(url);
-        HttpURLConnection conn = (HttpURLConnection) u.openConnection();
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
-        conn.setRequestProperty("User-Agent", "ModUpdater/1.0");
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdater/1.0");
         
         int code = conn.getResponseCode();
         if (code < 200 || code >= 300) {
