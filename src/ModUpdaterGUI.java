@@ -132,6 +132,8 @@ import java.util.zip.ZipFile;
  * --assetsRegex <regex> Regex to match the assets ZIP (optional)
  * --mode <mode>        Installation mode: mods, clientJar, or jarmods
  * --newsUrl <url>      URL for embedded news/patch notes page
+ * --resourcePackBranch <branch> Stable resource sync branch (default: main)
+ * --resourcePackBetaBranch <branch> Beta resource sync branch (default: beta)
  * 
  * =============================================================================
  * CONFIGURATION FILE (updater.properties)
@@ -145,6 +147,8 @@ import java.util.zip.ZipFile;
  *   mode=mods
  *   newsUrl=https://example.com/patchnotes
  *   launcherRepo=YourOrg/launcher-updates
+ *   resourcePackBranch=main
+ *   resourcePackBetaBranch=beta
  * 
  * @author Minecraft Oldschool Edition Team
  * @see ModUpdater CLI version of this updater
@@ -371,6 +375,7 @@ public final class ModUpdaterGUI {
             // Resource pack repository (assets synced before each launch)
             String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
             String resourcePackBranch = value(cli, cfg, "resourcePackBranch", "main");
+            String resourcePackBetaBranch = value(cli, cfg, "resourcePackBetaBranch", "beta");
 
             // =================================================================
             // STEP 4: Resolve Directory Paths
@@ -434,10 +439,15 @@ public final class ModUpdaterGUI {
             state.configPath = configPath;                 // Path to config file
             state.instanceRoot = instanceRoot;             // Instance root directory
             state.launcherUpdate = checkLauncherUpdate(launcherRepo, launcherJarRegex, launcherJarPath, instanceRoot);
+            if (wasRestartedAfterLauncherUpdate() && state.launcherUpdate != null) {
+                state.launcherUpdate.updateAvailable = false;
+            }
             state.branch = branch;                         // Current branch context
             state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
-            state.resourcePackBranch = resourcePackBranch; // Resource pack branch
+            state.resourcePackBranch = resourcePackBranch; // Stable resource pack branch
+            state.resourcePackBetaBranch = resourcePackBetaBranch; // Beta resource pack branch
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
+            state.launchArgs = args != null ? (String[]) args.clone() : new String[0];
             
             // Display the launcher GUI (blocks until user closes it)
             showLauncher(bgPath, minecraftDir, instanceRoot, mode, jarRegex, serverJarRegex, assetsRegex, jarmodName, state, newsUrl);
@@ -459,7 +469,8 @@ public final class ModUpdaterGUI {
             String a = args[i];
             if ("--config".equals(a) || "--repo".equals(a) || "--betaRepo".equals(a) || "--jarRegex".equals(a) || "--serverJarRegex".equals(a) || "--assetsRegex".equals(a)
                 || "--minecraftDir".equals(a) || "--instanceDir".equals(a) || "--mode".equals(a)
-                || "--jarmodName".equals(a) || "--newsUrl".equals(a)) {
+                || "--jarmodName".equals(a) || "--newsUrl".equals(a)
+                || "--resourcePackRepo".equals(a) || "--resourcePackBranch".equals(a) || "--resourcePackBetaBranch".equals(a)) {
                 if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + a);
                 map.put(a, args[++i]);
             } else {
@@ -509,6 +520,7 @@ public final class ModUpdaterGUI {
         sb.append("newsUrl=https://minecraftoldschool.com/updates.html").append(newline);
         sb.append("resourcePackRepo=MinecraftOldschoolEdition/resourcepack").append(newline);
         sb.append("resourcePackBranch=main").append(newline);
+        sb.append("resourcePackBetaBranch=beta").append(newline);
         Files.write(configPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -625,6 +637,35 @@ public final class ModUpdaterGUI {
         return a != null ? a : b;
     }
 
+    private static String currentResourcePackBranch(LauncherState state) {
+        if (state == null) return "main";
+        if (state.useBetaUpdates) {
+            String betaBranch = state.resourcePackBetaBranch;
+            return betaBranch != null && betaBranch.trim().length() > 0 ? betaBranch : "beta";
+        }
+        return state.resourcePackBranch;
+    }
+
+    private static boolean wasRestartedAfterLauncherUpdate() {
+        String value = getenv("MCOSE_LAUNCHER_RESTARTED_AFTER_UPDATE");
+        return "1".equals(value) || "true".equalsIgnoreCase(value);
+    }
+
+    private static String launcherVersionText(LauncherState state) {
+        if (state == null || state.launcherUpdate == null) {
+            return "unknown";
+        }
+        LauncherUpdateState update = state.launcherUpdate;
+        String current = update.currentVersion;
+        if (current == null || current.trim().isEmpty()) {
+            current = "unknown";
+        }
+        if (update.updateAvailable && update.latest != null && update.latest.tag != null && update.latest.tag.trim().length() > 0) {
+            return current + " (latest: " + update.latest.tag.trim() + ")";
+        }
+        return current;
+    }
+
     /**
      * Small bit of mutable launcher state shared between the main window and
      * the options dialog (for "Force update").
@@ -641,7 +682,9 @@ public final class ModUpdaterGUI {
         Path instanceRoot;
         String resourcePackRepo;
         String resourcePackBranch;
+        String resourcePackBetaBranch;
         Path minecraftDir;
+        String[] launchArgs;
     }
 
     private static final class BranchContext {
@@ -1431,6 +1474,9 @@ public final class ModUpdaterGUI {
                 // Play button: only prompt if force-update is enabled or the active branch has an update.
                 playButton.addActionListener(new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
+                        if (startMandatoryLauncherSelfUpdate(frame, launcherState, cardPanel, cards, bottomBg, root, progressCanvas)) {
+                            return;
+                        }
                         boolean needsUpdate = launcherState != null && (launcherState.forceUpdate || launcherState.hasUpdate);
                         if (needsUpdate) {
                             showPrompt();
@@ -1462,7 +1508,7 @@ public final class ModUpdaterGUI {
                                         ui.progress(10);
                                         ResourceSyncResult syncResult = syncResourcePack(
                                                 launcherState.resourcePackRepo,
-                                                launcherState.resourcePackBranch,
+                                                currentResourcePackBranch(launcherState),
                                                 launcherState.minecraftDir,
                                                 ResourceSyncMode.SMART,
                                                 false);
@@ -1517,6 +1563,9 @@ public final class ModUpdaterGUI {
                 // Hook up prompt buttons now that all dependencies are defined
                 yesButton.addActionListener(new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
+                        if (startMandatoryLauncherSelfUpdate(frame, launcherState, cardPanel, cards, bottomBg, root, progressCanvas)) {
+                            return;
+                        }
                         cards.show(cardPanel, "update");
                         final ProgressUI ui = new EmbeddedProgressUI(progressCanvas);
                         Thread t = new Thread(new Runnable() {
@@ -1545,7 +1594,7 @@ public final class ModUpdaterGUI {
                                     if (launcherState != null) {
                                         ResourceSyncResult syncResult = syncResourcePack(
                                                 launcherState.resourcePackRepo,
-                                                launcherState.resourcePackBranch,
+                                                currentResourcePackBranch(launcherState),
                                                 launcherState.minecraftDir,
                                                 syncMode,
                                                 strictSync);
@@ -1575,6 +1624,9 @@ public final class ModUpdaterGUI {
                 });
                 noButton.addActionListener(new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
+                        if (startMandatoryLauncherSelfUpdate(frame, launcherState, cardPanel, cards, bottomBg, root, progressCanvas)) {
+                            return;
+                        }
                         // Show update screen and sync resource pack before launching
                         cards.show(cardPanel, "update");
                         root.revalidate();
@@ -1588,7 +1640,7 @@ public final class ModUpdaterGUI {
                                         ui.progress(10);
                                         ResourceSyncResult syncResult = syncResourcePack(
                                                 launcherState.resourcePackRepo,
-                                                launcherState.resourcePackBranch,
+                                                currentResourcePackBranch(launcherState),
                                                 launcherState.minecraftDir,
                                                 ResourceSyncMode.SMART,
                                                 false);
@@ -1638,6 +1690,128 @@ public final class ModUpdaterGUI {
         }
     }
 
+    private static boolean startMandatoryLauncherSelfUpdate(
+            final JFrame frame,
+            final LauncherState launcherState,
+            final JPanel cardPanel,
+            final CardLayout cards,
+            final JComponent bottomBg,
+            final JComponent root,
+            final ProgressCanvas progressCanvas) {
+
+        if (!hasBlockingLauncherSelfUpdate(launcherState)) {
+            return false;
+        }
+
+        cards.show(cardPanel, "update");
+        bottomBg.setVisible(false);
+        bottomBg.revalidate();
+        root.revalidate();
+        root.repaint();
+
+        final ProgressUI ui = new EmbeddedProgressUI(progressCanvas);
+        Thread t = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    updateLauncherAndRestart(frame, launcherState, ui);
+                } catch (Throwable ex) {
+                    showError(ex);
+                    System.exit(1);
+                }
+            }
+        }, "LauncherSelfUpdateRestart");
+        t.setDaemon(false);
+        t.start();
+        return true;
+    }
+
+    private static boolean hasBlockingLauncherSelfUpdate(LauncherState launcherState) {
+        if (wasRestartedAfterLauncherUpdate()) return false;
+        if (launcherState == null || launcherState.launcherUpdate == null) return false;
+        LauncherUpdateState update = launcherState.launcherUpdate;
+        return update.updateAvailable && update.asset != null;
+    }
+
+    private static void updateLauncherAndRestart(JFrame frame, LauncherState launcherState, ProgressUI ui) throws Exception {
+        if (launcherState == null || launcherState.launcherUpdate == null) {
+            throw new IOException("Launcher update state is unavailable.");
+        }
+        LauncherUpdateState update = launcherState.launcherUpdate;
+        if (!update.updateAvailable || update.asset == null) {
+            return;
+        }
+        if (update.launcherJar == null) {
+            throw new IOException("Cannot update the launcher because its jar path could not be determined.");
+        }
+
+        ui.setPhaseText("Downloading launcher update...");
+        Path download = downloadToTemp(ui, update.asset.url, update.asset.name, 0.0, 0.75);
+
+        ui.setPhaseText("Installing launcher update...");
+        ui.progress(82);
+        boolean appliedNow = installLauncherUpdate(update.launcherJar, download, update.latest != null ? update.latest.tag : null, launcherState.instanceRoot);
+        if (!appliedNow) {
+            throw new IOException("Launcher update was staged, but the current launcher jar is locked. The game launch was stopped so old asset-fetching code cannot run. Restart Prism/PrismMC to finish installing the launcher update.");
+        }
+
+        launcherState.launcherUpdate.updateAvailable = false;
+        launcherState.launcherUpdate.currentVersion = update.latest != null ? update.latest.tag : update.currentVersion;
+        ui.setPhaseText("Restarting launcher...");
+        ui.progress(100);
+        try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
+
+        disposeFrame(frame);
+        int exitCode = restartLauncherAndWait(update.launcherJar, launcherState.launchArgs);
+        System.exit(exitCode);
+    }
+
+    private static int restartLauncherAndWait(Path launcherJar, String[] args) throws IOException, InterruptedException {
+        if (launcherJar == null) {
+            throw new IOException("Launcher jar path is unknown.");
+        }
+        String javaBin = javaExecutablePath();
+        List<String> cmd = new ArrayList<String>();
+        cmd.add(javaBin);
+        cmd.add("-jar");
+        cmd.add(launcherJar.toAbsolutePath().toString());
+        if (args != null) {
+            for (int i = 0; i < args.length; i++) {
+                cmd.add(args[i]);
+            }
+        }
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.inheritIO();
+        pb.environment().put("MCOSE_LAUNCHER_RESTARTED_AFTER_UPDATE", "1");
+        Process child = pb.start();
+        return child.waitFor();
+    }
+
+    private static String javaExecutablePath() {
+        String javaHome = System.getProperty("java.home");
+        if (javaHome == null || javaHome.trim().isEmpty()) {
+            return "java";
+        }
+        String exe = isWindows() ? "java.exe" : "java";
+        return javaHome + File.separator + "bin" + File.separator + exe;
+    }
+
+    private static boolean isWindows() {
+        String os = System.getProperty("os.name", "");
+        return os.toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    private static void disposeFrame(final JFrame frame) {
+        if (frame == null) return;
+        try {
+            SwingUtilities.invokeAndWait(new Runnable() {
+                public void run() {
+                    frame.dispose();
+                }
+            });
+        } catch (Exception ignored) {}
+    }
+
     private static void runLauncherSelfUpdate(
             final JFrame frame,
             final LauncherState launcherState,
@@ -1658,20 +1832,7 @@ public final class ModUpdaterGUI {
             public void run() {
                 try {
                     ButtonProgressUI progress = new ButtonProgressUI(updateButton);
-                    Path download = downloadToTemp(progress, update.asset.url, update.asset.name, 0.0, 1.0);
-                    boolean appliedNow = installLauncherUpdate(update.launcherJar, download, update.latest != null ? update.latest.tag : null, launcherState.instanceRoot);
-                    SwingUtilities.invokeLater(new Runnable() {
-                        public void run() {
-                            updateButton.setVisible(false);
-                            updateButton.setEnabled(false);
-                            launcherState.launcherUpdate.updateAvailable = false;
-                            launcherState.launcherUpdate.currentVersion = update.latest != null ? update.latest.tag : update.currentVersion;
-                            String msg = appliedNow
-                                    ? "Launcher updated successfully. Restart Prism/PrismMC to relaunch with the new build."
-                                    : "Launcher update staged. Restart Prism/PrismMC to finish installing.";
-                            JOptionPane.showMessageDialog(frame, msg, "Launcher update", JOptionPane.INFORMATION_MESSAGE);
-                        }
-                    });
+                    updateLauncherAndRestart(frame, launcherState, progress);
                 } catch (final Throwable ex) {
                     SwingUtilities.invokeLater(new Runnable() {
                         public void run() {
@@ -1683,7 +1844,7 @@ public final class ModUpdaterGUI {
                 }
             }
         }, "LauncherSelfUpdate");
-        t.setDaemon(true);
+        t.setDaemon(false);
         t.start();
     }
 
@@ -1747,6 +1908,20 @@ public final class ModUpdaterGUI {
         c.gridx = 0;
         c.gridy = 1;
         c.insets = new Insets(6, 0, 4, 8);
+        JLabel versionLabel = new JLabel("Launcher version:");
+        center.add(versionLabel, c);
+
+        c.gridx = 1;
+        c.weightx = 1.0;
+        c.fill = GridBagConstraints.HORIZONTAL;
+        JLabel versionValue = new JLabel(launcherVersionText(launcherState));
+        center.add(versionValue, c);
+
+        c.gridx = 0;
+        c.gridy = 2;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
+        c.insets = new Insets(6, 0, 4, 8);
         JLabel pathLabel = new JLabel("Game location on disk:");
         center.add(pathLabel, c);
 
@@ -1776,7 +1951,7 @@ public final class ModUpdaterGUI {
 
         // Clear Backups row - deletes old .bak files (renamed jars from previous updates)
         c.gridx = 0;
-        c.gridy = 2;
+        c.gridy = 3;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
         c.insets = new Insets(6, 0, 4, 8);
@@ -1805,7 +1980,7 @@ public final class ModUpdaterGUI {
         
         // Fetch Resources row - deletes resources folder and performs a full re-download.
         c.gridx = 0;
-        c.gridy = 3;
+        c.gridy = 4;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
         c.insets = new Insets(6, 0, 4, 8);
@@ -1833,8 +2008,10 @@ public final class ModUpdaterGUI {
                     return;
                 }
                 
-                final String repo = "MinecraftOldschoolEdition/resourcepack";
-                final String branch = "main";
+                final String repo = launcherState != null && launcherState.resourcePackRepo != null && launcherState.resourcePackRepo.trim().length() > 0
+                        ? launcherState.resourcePackRepo
+                        : "MinecraftOldschoolEdition/resourcepack";
+                final String branch = currentResourcePackBranch(launcherState);
                 
                 fetchResourcesButton.setEnabled(false);
                 fetchResourcesButton.setText("Fetching...");
@@ -1859,7 +2036,7 @@ public final class ModUpdaterGUI {
                                     fetchResourcesButton.setText("Fetch Resources");
                                     JOptionPane.showMessageDialog(
                                             dialog,
-                                            "Resources were fully re-downloaded from https://github.com/" + repo + ".",
+                                            "Resources were fully re-downloaded from https://github.com/" + repo + " (" + normalizeResourcePackBranch(branch) + ").",
                                             "Fetch Resources",
                                             JOptionPane.INFORMATION_MESSAGE);
                                 }
