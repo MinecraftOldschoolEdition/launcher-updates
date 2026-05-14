@@ -62,7 +62,8 @@ import javax.net.ssl.X509TrustManager;
  *
  * COMMAND LINE OPTIONS:
  *   --repo          Required. GitHub repository in "owner/repo" format
- *   --assetRegex    Required. Regex pattern to match the desired release asset
+ *   --assetRegex    Optional. Regex pattern to match the desired patch asset
+ *   --serverAssetRegex Optional. Regex pattern to match the LAN server jar asset
  *   --mode          Optional. "mods" (default) or "clientJar"
  *   --minecraftDir  Optional. Path to the .minecraft directory
  *   --instanceDir   Optional. Path to the Prism/MultiMC instance directory
@@ -85,6 +86,10 @@ public final class ModUpdater {
     
     /** GitHub API endpoint template for fetching the latest release */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
+    private static final String DEFAULT_ASSET_REGEX = "patch\\.jar";
+    private static final String DEFAULT_SERVER_ASSET_REGEX = "server\\.jar";
+    private static final String LAN_SERVER_DIR_NAME = "lan-server";
+    private static final String LAN_SERVER_JAR_NAME = "server.jar";
     
     /**
      * OS trust bundle paths used to supplement outdated Java truststores.
@@ -124,7 +129,8 @@ public final class ModUpdater {
 
             // Extract required options (will throw if missing)
             String repo = required(opts, "--repo");           // GitHub repo: "owner/repo"
-            String assetRegex = required(opts, "--assetRegex"); // Regex to match asset filename
+            String assetRegex = optional(opts.get("--assetRegex"), DEFAULT_ASSET_REGEX); // Regex to match patch asset filename
+            String serverAssetRegex = normalizeOptionalRegex(optional(opts.get("--serverAssetRegex"), DEFAULT_SERVER_ASSET_REGEX));
             
             // Extract optional options with defaults
             String mode = opts.getOrDefault("--mode", "mods"); // Installation mode
@@ -147,16 +153,27 @@ public final class ModUpdater {
             LatestRelease release = fetchLatestRelease(repo);
             
             // Find the asset that matches our regex pattern
-            ReleaseAsset asset = selectAsset(release.assets, assetRegex);
+            ReleaseAsset asset = selectOptionalAsset(release.assets, assetRegex);
             if (asset == null) {
-                throw new IllegalStateException("No asset matches regex '" + assetRegex + "' in latest release.");
+                log("No patch asset matches regex '" + assetRegex + "' in latest release; skipping client patch install.");
+            }
+            ReleaseAsset serverAsset = selectOptionalAsset(release.assets, serverAssetRegex);
+            if (serverAssetRegex != null && serverAsset == null) {
+                log("No LAN server asset matches regex '" + serverAssetRegex + "' in latest release; skipping LAN server install.");
+            }
+            if (asset == null && serverAsset == null) {
+                log("No matching patch.jar or server.jar assets in latest release. Nothing to update.");
+                return;
             }
 
             log("Latest: " + release.tag);
-            log("Asset:  " + asset.name);
+            if (asset != null) log("Patch:  " + asset.name);
+            if (serverAsset != null) log("Server: " + serverAsset.name);
 
             // Handle "mods" mode - install to mods/ directory
-            if ("mods".equalsIgnoreCase(mode)) {
+            if (asset == null) {
+                log("Skipping client patch update.");
+            } else if ("mods".equalsIgnoreCase(mode)) {
                 Path modsDir = minecraftDir.resolve("mods");
                 ensureDir(modsDir);
 
@@ -224,6 +241,7 @@ public final class ModUpdater {
             } else {
                 throw new IllegalArgumentException("Unsupported --mode: " + mode);
             }
+            installLanServerJar(minecraftDir, serverAsset, yes, dryRun);
         } catch (Exception e) {
             logErr(e.getMessage());
             e.printStackTrace(System.err);
@@ -275,6 +293,16 @@ public final class ModUpdater {
         String v = opts.get(key);
         if (v == null || v.trim().isEmpty()) throw new IllegalArgumentException("Missing required option: " + key);
         return v;
+    }
+
+    private static String optional(String value, String fallback) {
+        return value == null ? fallback : value;
+    }
+
+    private static String normalizeOptionalRegex(String regex) {
+        if (regex == null) return null;
+        String trimmed = regex.trim();
+        return trimmed.length() == 0 ? null : trimmed;
     }
 
     // =========================================================================
@@ -846,6 +874,37 @@ public final class ModUpdater {
             if (p.matcher(a.name).find()) return a;
         }
         return null;
+    }
+
+    private static ReleaseAsset selectOptionalAsset(List<ReleaseAsset> assets, String assetRegex) {
+        if (assetRegex == null || assetRegex.trim().length() == 0) {
+            return null;
+        }
+        return selectAsset(assets, assetRegex);
+    }
+
+    private static void installLanServerJar(Path minecraftDir, ReleaseAsset serverAsset, boolean yes, boolean dryRun) throws IOException {
+        if (serverAsset == null) {
+            return;
+        }
+        Path lanServerDir = minecraftDir.resolve(LAN_SERVER_DIR_NAME);
+        Path dest = lanServerDir.resolve(LAN_SERVER_JAR_NAME);
+        if (!yes) {
+            if (!confirm("Install LAN server jar to '" + dest + "'?")) return;
+        }
+        if (dryRun) {
+            log("[dry-run] Would download and install LAN server jar to: " + dest);
+            return;
+        }
+        ensureDir(lanServerDir);
+        Path downloaded = downloadToTemp(serverAsset.url, serverAsset.name);
+        if (Files.isRegularFile(dest)) {
+            Path backup = withUniqueSuffix(dest, ".bak");
+            log("Backing up LAN server jar -> " + backup);
+            Files.move(dest, backup, StandardCopyOption.REPLACE_EXISTING);
+        }
+        log("Installing LAN server jar -> " + dest);
+        Files.move(downloaded, dest, StandardCopyOption.REPLACE_EXISTING);
     }
 
     // =========================================================================

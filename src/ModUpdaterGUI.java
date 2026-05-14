@@ -228,6 +228,11 @@ public final class ModUpdaterGUI {
     
     /** GitHub API endpoint template for fetching the latest release from a repository */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
+
+    /** Optional companion server jar shipped next to patch.jar for Open To Multiplayer. */
+    private static final String DEFAULT_SERVER_JAR_REGEX = "server\\.jar";
+    private static final String LAN_SERVER_DIR_NAME = "lan-server";
+    private static final String LAN_SERVER_JAR_NAME = "server.jar";
     
     /**
      * OS trust bundle paths used to supplement outdated Java truststores.
@@ -345,7 +350,8 @@ public final class ModUpdaterGUI {
             String betaRepo = value(cli, cfg, "betaRepo", null);
 
             // Regex patterns for identifying release assets
-            String jarRegex = value(cli, cfg, "jarRegex", ".*\\.jar");      // Pattern for mod JAR
+            String jarRegex = value(cli, cfg, "jarRegex", "patch\\.jar");   // Pattern for mod JAR
+            String serverJarRegex = normalizeOptionalRegex(value(cli, cfg, "serverJarRegex", DEFAULT_SERVER_JAR_REGEX)); // Optional LAN server JAR
             String assetsRegex = value(cli, cfg, "assetsRegex", null);       // Pattern for assets ZIP (optional)
             
             // Installation mode: mods (default), clientJar (legacy), or jarmods
@@ -407,7 +413,7 @@ public final class ModUpdaterGUI {
             boolean useBetaUpdates = "true".equalsIgnoreCase(cfg.getProperty("useBetaUpdates"));
             
             // Fetch the current update state (checks installed version vs latest release)
-            BranchContext branch = fetchBranchState(useBetaUpdates, repo, betaRepo, jarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
+            BranchContext branch = fetchBranchState(useBetaUpdates, repo, betaRepo, jarRegex, serverJarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
             
             // Find the dirt background image for the classic look
             Path bgPath = findBgPath(minecraftDir);
@@ -434,7 +440,7 @@ public final class ModUpdaterGUI {
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             
             // Display the launcher GUI (blocks until user closes it)
-            showLauncher(bgPath, minecraftDir, instanceRoot, mode, jarRegex, assetsRegex, jarmodName, state, newsUrl);
+            showLauncher(bgPath, minecraftDir, instanceRoot, mode, jarRegex, serverJarRegex, assetsRegex, jarmodName, state, newsUrl);
         } catch (Throwable t) {
             // If the updater fails for any reason, log/show the error but do NOT
             // fail the outer launcher; exit with 0 so the game can still start.
@@ -451,7 +457,7 @@ public final class ModUpdaterGUI {
         Map<String, String> map = new HashMap<String, String>();
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
-            if ("--config".equals(a) || "--repo".equals(a) || "--betaRepo".equals(a) || "--jarRegex".equals(a) || "--assetsRegex".equals(a)
+            if ("--config".equals(a) || "--repo".equals(a) || "--betaRepo".equals(a) || "--jarRegex".equals(a) || "--serverJarRegex".equals(a) || "--assetsRegex".equals(a)
                 || "--minecraftDir".equals(a) || "--instanceDir".equals(a) || "--mode".equals(a)
                 || "--jarmodName".equals(a) || "--newsUrl".equals(a)) {
                 if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + a);
@@ -495,6 +501,7 @@ public final class ModUpdaterGUI {
         sb.append("repo=MinecraftOldschoolEdition/release-patches").append(newline);
         sb.append("betaRepo=MinecraftOldschoolEdition/beta-patches").append(newline);
         sb.append("jarRegex=patch\\.jar").append(newline);
+        sb.append("serverJarRegex=").append(DEFAULT_SERVER_JAR_REGEX).append(newline);
         sb.append("assetsRegex=(assets|resources).*(?i)\\.zip").append(newline);
         sb.append("mode=jarmods").append(newline);
         sb.append("jarmodName=mod.jar").append(newline);
@@ -510,6 +517,12 @@ public final class ModUpdaterGUI {
         if (v != null) return v;
         v = cfg.getProperty(key);
         return v != null ? v : def;
+    }
+
+    private static String normalizeOptionalRegex(String regex) {
+        if (regex == null) return null;
+        String trimmed = regex.trim();
+        return trimmed.length() == 0 ? null : trimmed;
     }
     
     // Canonical news URL - all old URLs should redirect here
@@ -636,6 +649,7 @@ public final class ModUpdaterGUI {
         boolean beta;
         LatestRelease latest;
         ReleaseAsset jarAsset;
+        ReleaseAsset serverJarAsset;
         ReleaseAsset assetsZip;
         boolean upToDate;
     }
@@ -764,6 +778,7 @@ public final class ModUpdaterGUI {
             String releaseRepo,
             String betaRepo,
             String jarRegex,
+            String serverJarRegex,
             String assetsRegex,
             Path minecraftDir,
             Path instanceRoot,
@@ -776,18 +791,23 @@ public final class ModUpdaterGUI {
         }
 
         LatestRelease latest = fetchLatestRelease(repo);
-        ReleaseAsset jarAsset = selectAsset(latest.assets, jarRegex);
+        ReleaseAsset jarAsset = selectOptionalAsset(latest.assets, jarRegex);
         if (jarAsset == null) {
-            throw new IllegalStateException("No release asset matches jarRegex '" + jarRegex + "' in repo " + repo);
+            System.out.println("[mod-updater] No patch jar asset matched jarRegex '" + jarRegex + "' in repo " + repo + "; skipping client patch install for this release.");
+        }
+        ReleaseAsset serverJarAsset = selectOptionalAsset(latest.assets, serverJarRegex);
+        if (serverJarRegex != null && serverJarAsset == null) {
+            System.out.println("[mod-updater] No server jar asset matched serverJarRegex '" + serverJarRegex + "' in repo " + repo + "; skipping LAN server install for this release.");
         }
         ReleaseAsset assetsZip = assetsRegex != null ? selectAsset(latest.assets, assetsRegex) : null;
-        boolean upToDate = isUpToDate(minecraftDir, instanceRoot, mode, jarRegex, jarAsset.name, latest.tag, jarmodName);
+        boolean upToDate = isUpToDate(minecraftDir, instanceRoot, mode, jarRegex, jarAsset, serverJarAsset, latest.tag, jarmodName);
 
         BranchContext ctx = new BranchContext();
         ctx.repo = repo;
         ctx.beta = useBeta && betaRepo != null && !betaRepo.isEmpty();
         ctx.latest = latest;
         ctx.jarAsset = jarAsset;
+        ctx.serverJarAsset = serverJarAsset;
         ctx.assetsZip = assetsZip;
         ctx.upToDate = upToDate;
         return ctx;
@@ -1132,6 +1152,7 @@ public final class ModUpdaterGUI {
             final Path instanceRoot,
             final String mode,
             final String jarRegex,
+            final String serverJarRegex,
             final String assetsRegex,
             final String jarmodName,
             final LauncherState launcherState,
@@ -1480,6 +1501,7 @@ public final class ModUpdaterGUI {
                                     launcherState.releaseRepo,
                                     launcherState.betaRepo,
                                     jarRegex,
+                                    serverJarRegex,
                                     assetsRegex,
                                     minecraftDir,
                                     instanceRoot,
@@ -1505,13 +1527,14 @@ public final class ModUpdaterGUI {
                                             launcherState != null ? launcherState.releaseRepo : null,
                                             launcherState != null ? launcherState.betaRepo : null,
                                             jarRegex,
+                                            serverJarRegex,
                                             assetsRegex,
                                             minecraftDir,
                                             instanceRoot,
                                             mode,
                                             jarmodName);
 
-                                    runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.assetsZip, ctx.latest, jarmodName);
+                                    runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.serverJarAsset, ctx.assetsZip, ctx.latest, jarmodName);
                                     
                                     boolean forceResync = launcherState != null && launcherState.forceUpdate;
                                     ResourceSyncMode syncMode = forceResync ? ResourceSyncMode.FULL : ResourceSyncMode.SMART;
@@ -1912,6 +1935,7 @@ public final class ModUpdaterGUI {
             final String releaseRepo,
             final String betaRepo,
             final String jarRegex,
+            final String serverJarRegex,
             final String assetsRegex,
             final Path minecraftDir,
             final Path instanceRoot,
@@ -1931,7 +1955,7 @@ public final class ModUpdaterGUI {
         Thread t = new Thread(new Runnable() {
             public void run() {
                 try {
-                    BranchContext ctx = fetchBranchState(desiredBeta, releaseRepo, betaRepo, jarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
+                    BranchContext ctx = fetchBranchState(desiredBeta, releaseRepo, betaRepo, jarRegex, serverJarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
                     launcherState.branch = ctx;
                     launcherState.hasUpdate = !ctx.upToDate;
                     launcherState.useBetaUpdates = desiredBeta;
@@ -2090,67 +2114,99 @@ public final class ModUpdaterGUI {
     }
 
     private static void runUpdate(ProgressUI ui, Path minecraftDir, Path instanceRoot, String mode, String jarRegex,
-                                  ReleaseAsset jarAsset, ReleaseAsset assetsZip, LatestRelease latest, String jarmodName) throws Exception {
+                                  ReleaseAsset jarAsset, ReleaseAsset serverJarAsset, ReleaseAsset assetsZip, LatestRelease latest, String jarmodName) throws Exception {
         if ("mods".equalsIgnoreCase(mode)) {
-            Path modsDir = minecraftDir.resolve("mods");
-            ensureDir(modsDir);
+            if (jarAsset != null) {
+                Path modsDir = minecraftDir.resolve("mods");
+                ensureDir(modsDir);
 
-            Path existing = findExistingMatching(modsDir, jarRegex);
-            if (existing != null) {
-                Path backup = withUniqueSuffix(existing, ".bak");
-                ui.setPhaseText("Backing up existing mod...");
-                Files.move(existing, backup, StandardCopyOption.REPLACE_EXISTING);
+                Path existing = findExistingMatching(modsDir, jarRegex);
+                if (existing != null) {
+                    Path backup = withUniqueSuffix(existing, ".bak");
+                    ui.setPhaseText("Backing up existing mod...");
+                    Files.move(existing, backup, StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                ui.setPhaseText("Downloading mod...");
+                Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
+                ui.setPhaseText("Extracting assets...");
+                extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
+
+                Path dest = modsDir.resolve(jarAsset.name);
+                ui.setPhaseText("Installing mod jar...");
+                moveOrCopy(downloaded, dest);
+                writeMarker(dest, latest, jarAsset);
+            } else {
+                ui.log("No patch jar in this release; skipping mod update.");
             }
-
-            ui.setPhaseText("Downloading mod...");
-            Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
-            ui.setPhaseText("Extracting assets...");
-            extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
-
-            Path dest = modsDir.resolve(jarAsset.name);
-            ui.setPhaseText("Installing mod jar...");
-            moveOrCopy(downloaded, dest);
-            writeMarker(dest, latest, jarAsset);
         } else if ("jarmods".equalsIgnoreCase(mode)) {
-            if (instanceRoot == null) throw new IllegalArgumentException("jarmods mode requires instance root; pass --instanceDir or configure instanceDir.");
-            Path jarmodsDir = instanceRoot.resolve("jarmods");
-            ensureDir(jarmodsDir);
+            if (jarAsset != null) {
+                if (instanceRoot == null) throw new IllegalArgumentException("jarmods mode requires instance root; pass --instanceDir or configure instanceDir.");
+                Path jarmodsDir = instanceRoot.resolve("jarmods");
+                ensureDir(jarmodsDir);
 
-            // Download, then extract assets and install as fixed name (jarmodName)
-            ui.setPhaseText("Downloading jarmod...");
-            Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
-            ui.setPhaseText("Extracting assets...");
-            extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
-            Path dest = pickJarmodTarget(jarmodsDir, jarmodName);
-            if (Files.isRegularFile(dest)) {
-                Path backup = withUniqueSuffix(dest, ".bak");
-                ui.setPhaseText("Backing up existing jarmod...");
-                Files.move(dest, backup, StandardCopyOption.REPLACE_EXISTING);
+                // Download, then extract assets and install as fixed name (jarmodName)
+                ui.setPhaseText("Downloading jarmod...");
+                Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
+                ui.setPhaseText("Extracting assets...");
+                extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
+                Path dest = pickJarmodTarget(jarmodsDir, jarmodName);
+                if (Files.isRegularFile(dest)) {
+                    Path backup = withUniqueSuffix(dest, ".bak");
+                    ui.setPhaseText("Backing up existing jarmod...");
+                    Files.move(dest, backup, StandardCopyOption.REPLACE_EXISTING);
+                }
+                ui.setPhaseText("Installing update...");
+                moveOrCopy(downloaded, dest);
+                writeMarker(dest, latest, jarAsset);
+            } else {
+                ui.log("No patch jar in this release; skipping jarmod update.");
             }
-            ui.setPhaseText("Installing update...");
-            moveOrCopy(downloaded, dest);
-            writeMarker(dest, latest, jarAsset);
         } else if ("clientJar".equalsIgnoreCase(mode)) {
-            Path clientJar = resolveClientJarPath(minecraftDir, null);
-            if (clientJar == null) throw new IllegalArgumentException("Cannot resolve client jar at 'bin/minecraft.jar'.");
-            ui.setPhaseText("Downloading client jar...");
-            Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
-            ui.setPhaseText("Extracting assets...");
-            extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
-            Path backup = withUniqueSuffix(clientJar, ".bak");
-            ui.setPhaseText("Backing up old jar...");
-            Files.copy(clientJar, backup, StandardCopyOption.REPLACE_EXISTING);
-            ui.setPhaseText("Replacing client jar...");
-            moveOrCopy(downloaded, clientJar);
-            writeMarker(clientJar, latest, jarAsset);
+            if (jarAsset != null) {
+                Path clientJar = resolveClientJarPath(minecraftDir, null);
+                if (clientJar == null) throw new IllegalArgumentException("Cannot resolve client jar at 'bin/minecraft.jar'.");
+                ui.setPhaseText("Downloading client jar...");
+                Path downloaded = downloadToTemp(ui, jarAsset.url, jarAsset.name, 0.0, 0.7);
+                ui.setPhaseText("Extracting assets...");
+                extractAssetsFromJarToResources(ui, downloaded, minecraftDir, 0.7, 0.9);
+                Path backup = withUniqueSuffix(clientJar, ".bak");
+                ui.setPhaseText("Backing up old jar...");
+                Files.copy(clientJar, backup, StandardCopyOption.REPLACE_EXISTING);
+                ui.setPhaseText("Replacing client jar...");
+                moveOrCopy(downloaded, clientJar);
+                writeMarker(clientJar, latest, jarAsset);
+            } else {
+                ui.log("No patch jar in this release; skipping client jar update.");
+            }
         } else {
             throw new IllegalArgumentException("Unsupported mode: " + mode);
         }
+        installLanServerJar(ui, minecraftDir, serverJarAsset, latest);
         // Assets now extracted from the mod jar itself.
         
         // Note: Bouncy Castle dependency for friends system crypto is optional.
         // The friends system works without it (just without cryptographic verification).
         // Users who want crypto can manually add bcprov-jdk18on-1.78.1.jar as a jarmod.
+    }
+
+    private static void installLanServerJar(ProgressUI ui, Path minecraftDir, ReleaseAsset serverJarAsset, LatestRelease latest) throws Exception {
+        if (serverJarAsset == null) {
+            ui.log("No server jar in this release; skipping LAN server install.");
+            return;
+        }
+        Path lanServerDir = minecraftDir.resolve(LAN_SERVER_DIR_NAME);
+        ensureDir(lanServerDir);
+        Path dest = lanServerDir.resolve(LAN_SERVER_JAR_NAME);
+        Path downloaded = downloadToTemp(ui, serverJarAsset.url, serverJarAsset.name, 0.9, 0.98);
+        if (Files.isRegularFile(dest)) {
+            Path backup = withUniqueSuffix(dest, ".bak");
+            ui.setPhaseText("Backing up LAN server jar...");
+            Files.move(dest, backup, StandardCopyOption.REPLACE_EXISTING);
+        }
+        ui.setPhaseText("Installing LAN server jar...");
+        moveOrCopy(downloaded, dest);
+        writeMarker(dest, latest, serverJarAsset);
     }
     
     /**
@@ -2937,7 +2993,13 @@ public final class ModUpdaterGUI {
         }
     }
 
-    private static boolean isUpToDate(Path minecraftDir, Path instanceRoot, String mode, String jarRegex, String latestAssetName, String latestTag, String jarmodName) throws IOException {
+    private static boolean isUpToDate(Path minecraftDir, Path instanceRoot, String mode, String jarRegex, ReleaseAsset jarAsset, ReleaseAsset serverJarAsset, String latestTag, String jarmodName) throws IOException {
+        boolean patchUpToDate = jarAsset == null || isPatchJarUpToDate(minecraftDir, instanceRoot, mode, jarRegex, latestTag, jarmodName);
+        boolean serverUpToDate = serverJarAsset == null || isLanServerJarUpToDate(minecraftDir, latestTag);
+        return patchUpToDate && serverUpToDate;
+    }
+
+    private static boolean isPatchJarUpToDate(Path minecraftDir, Path instanceRoot, String mode, String jarRegex, String latestTag, String jarmodName) throws IOException {
         if ("mods".equalsIgnoreCase(mode)) {
             Path modsDir = minecraftDir.resolve("mods");
             Path existing = findExistingMatching(modsDir, jarRegex);
@@ -2959,6 +3021,14 @@ public final class ModUpdaterGUI {
             return m != null && equalsSafe(m.tag, latestTag);
         }
         return false;
+    }
+
+    private static boolean isLanServerJarUpToDate(Path minecraftDir, String latestTag) {
+        if (minecraftDir == null) return false;
+        Path serverJar = minecraftDir.resolve(LAN_SERVER_DIR_NAME).resolve(LAN_SERVER_JAR_NAME);
+        if (!Files.isRegularFile(serverJar)) return false;
+        InstalledMarker m = readMarker(serverJar);
+        return m != null && equalsSafe(m.tag, latestTag);
     }
     
     /**
@@ -3362,6 +3432,13 @@ public final class ModUpdaterGUI {
             if (p.matcher(a.name).find()) return a;
         }
         return null;
+    }
+
+    private static ReleaseAsset selectOptionalAsset(List<ReleaseAsset> assets, String assetRegex) {
+        if (assetRegex == null || assetRegex.trim().length() == 0) {
+            return null;
+        }
+        return selectAsset(assets, assetRegex);
     }
 
     private static Path downloadToTemp(ProgressUI ui, String url, String suggestedName, double start, double end) throws IOException {
