@@ -5,6 +5,7 @@
 // Swing GUI components
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.border.MatteBorder;
 import javax.swing.text.EditorKit;
 import javax.swing.text.html.HTMLDocument;
 import javax.swing.text.html.HTMLEditorKit;
@@ -1258,9 +1259,9 @@ public final class ModUpdaterGUI {
                 newsPane.setMargin(new Insets(8, 8, 8, 8));
 
                 JScrollPane scroll = new JScrollPane(newsPane);
-                // Remove the default scrollpane/viewport borders and ensure their background
-                // matches the page so there is no dark frame around the content.
-                scroll.setBorder(null);
+                // Vanilla puts the divider on the news pane itself: a two-pixel
+                // black MatteBorder immediately above the textured login panel.
+                scroll.setBorder(new MatteBorder(0, 0, 2, 0, Color.BLACK));
                 scroll.setBackground(newsBg);
                 scroll.getViewport().setBackground(newsBg);
                 scroll.getViewport().setBorder(null);
@@ -1356,81 +1357,31 @@ public final class ModUpdaterGUI {
 
                 // --- Page 3: classic updater progress screen, embedded ---
                 final ProgressCanvas progressCanvas = new ProgressCanvas(bgPath);
-                progressCanvas.setOpaque(false);
                 JPanel updatePage = new JPanel(new BorderLayout());
                 updatePage.setOpaque(false);
                 updatePage.add(progressCanvas, BorderLayout.CENTER);
                 cardPanel.add(updatePage, "update");
 
-                // Dirt bottom bar with Play / Options replacing the old login fields
-                BackgroundPanel bottomBg = new BackgroundPanel(bgPath);
-                // No extra top padding so the black separator line sits exactly on the dirt edge.
-                bottomBg.setBorder(new EmptyBorder(0, 0, 0, 0));
-                bottomBg.setLayout(new BorderLayout());
-                // Taller dirt bar so the logo and buttons sit more like the original launcher.
-                bottomBg.setPreferredSize(new Dimension(10, 96));
-                root.add(bottomBg, BorderLayout.SOUTH);
-
-                // Thin black line that sits directly above the dirt bar.
-                JComponent topBorder = new JComponent() {
-                    protected void paintComponent(Graphics g0) {
-                        g0.setColor(Color.BLACK);
-                        g0.fillRect(0, 0, getWidth(), 1);
-                    }
-                    public Dimension getPreferredSize() {
-                        return new Dimension(10, 1);
-                    }
-                };
-                bottomBg.add(topBorder, BorderLayout.NORTH);
-
-                JPanel bottomInner = new JPanel(new BorderLayout());
-                bottomInner.setOpaque(false);
-                bottomBg.add(bottomInner, BorderLayout.CENTER);
-
-                // Bottom left: Minecraft logo instead of text.
-                JLabel logoLabel = new JLabel();
-                logoLabel.setHorizontalAlignment(SwingConstants.LEFT);
-                logoLabel.setVerticalAlignment(SwingConstants.CENTER);
-                logoLabel.setBorder(new EmptyBorder(8, 12, 8, 0)); // inset a bit from the left edge
-                try {
-                    Image logoImg = loadLauncherLogoImage(minecraftDir);
-                    if (logoImg != null) {
-                        // Scale to better match the original launcher logo height.
-                        int targetH = 48;
-                        int w = logoImg.getWidth(null);
-                        int h = logoImg.getHeight(null);
-                        if (w > 0 && h > 0) {
-                            int targetW = (int) Math.round((targetH / (double) h) * w);
-                            Image scaled = logoImg.getScaledInstance(targetW, targetH, Image.SCALE_SMOOTH);
-                            logoLabel.setIcon(new ImageIcon(scaled));
-                        } else {
-                            logoLabel.setIcon(new ImageIcon(logoImg));
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-                bottomInner.add(logoLabel, BorderLayout.WEST);
-
-                // Right side: Options / Play buttons side by side, larger, with subtle rounded edges.
-                JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 16, 8));
-                buttonRow.setOpaque(false);
-                // Nudge buttons inward and further downward so they sit nicely centered vertically.
-                buttonRow.setBorder(new EmptyBorder(20, 4, 4, 20));
+                // Build the navigation strip with the same fixed geometry used by
+                // the vanilla launcher's TexturedPanel / LogoPanel combination.
                 final LegacyButton updateLauncherButton = new LegacyButton("Update Launcher");
                 final LegacyButton optionsButton = new LegacyButton("Options");
                 optionsButton.putClientProperty("primary", Boolean.TRUE);
                 final LegacyButton playButton = new LegacyButton("Play");
-                Dimension btnSize = new Dimension(140, 34); // slightly taller buttons for better vertical centering
-                updateLauncherButton.setPreferredSize(btnSize);
-                updateLauncherButton.setMinimumSize(btnSize);
-                optionsButton.setPreferredSize(btnSize);
-                optionsButton.setMinimumSize(btnSize);
-                playButton.setPreferredSize(btnSize);
-                playButton.setMinimumSize(btnSize);
-                buttonRow.add(updateLauncherButton);
-                buttonRow.add(optionsButton);
-                buttonRow.add(playButton);
-                bottomInner.add(buttonRow, BorderLayout.EAST);
+
+                Image launcherLogo = null;
+                try {
+                    launcherLogo = loadLauncherLogoImage(minecraftDir);
+                } catch (Throwable ignored) {
+                }
+
+                final LauncherNavPanel bottomBg = new LauncherNavPanel(
+                        bgPath,
+                        launcherLogo,
+                        updateLauncherButton,
+                        optionsButton,
+                        playButton);
+                root.add(bottomBg, BorderLayout.SOUTH);
 
                 boolean hasLauncherUpdate = launcherState != null
                         && launcherState.launcherUpdate != null
@@ -4031,6 +3982,120 @@ public final class ModUpdaterGUI {
         }
     }
 
+    /**
+     * Fixed-height dirt navigation strip based on the vanilla launcher's
+     * TexturedPanel and LogoPanel geometry and paint path.
+     */
+    private static final class LauncherNavPanel extends JPanel {
+        private static final int NAV_HEIGHT = 100;
+        private static final int TEXTURE_TILE_SIZE = 32;
+        private static final int LOGO_X = 24;
+        private static final int LOGO_Y = 24;
+        private static final int BUTTON_WIDTH = 143;
+        private static final int BUTTON_HEIGHT = 32;
+        private static final int BUTTON_GAP = 10;
+        private static final int BUTTON_RIGHT = 24;
+
+        private final JLabel logoLabel;
+        private final LegacyButton[] buttons;
+        private final Image dirtTile;
+        private BufferedImage texturedBackground;
+
+        LauncherNavPanel(Path bgPath, Image logo, LegacyButton... buttons) {
+            setOpaque(true);
+            setBackground(new Color(60, 43, 29));
+            setLayout(null);
+            setPreferredSize(new Dimension(100, NAV_HEIGHT));
+            setMinimumSize(new Dimension(0, NAV_HEIGHT));
+            setMaximumSize(new Dimension(Integer.MAX_VALUE, NAV_HEIGHT));
+
+            BufferedImage dirt = loadLauncherDirtImage(bgPath);
+            this.dirtTile = dirt != null
+                    ? dirt.getScaledInstance(TEXTURE_TILE_SIZE, TEXTURE_TILE_SIZE, Image.SCALE_AREA_AVERAGING)
+                    : null;
+
+            this.logoLabel = new JLabel(logo != null ? new ImageIcon(logo) : null);
+            this.logoLabel.setOpaque(false);
+            add(this.logoLabel);
+
+            this.buttons = buttons != null ? buttons : new LegacyButton[0];
+            Dimension buttonSize = new Dimension(BUTTON_WIDTH, BUTTON_HEIGHT);
+            for (LegacyButton button : this.buttons) {
+                if (button == null) continue;
+                button.setPreferredSize(buttonSize);
+                button.setMinimumSize(buttonSize);
+                button.setMaximumSize(buttonSize);
+                add(button);
+            }
+        }
+
+        public void doLayout() {
+            Icon logo = logoLabel.getIcon();
+            int logoWidth = logo != null ? logo.getIconWidth() : 0;
+            int logoHeight = logo != null ? logo.getIconHeight() : 0;
+            logoLabel.setBounds(LOGO_X, LOGO_Y, logoWidth, logoHeight);
+
+            int buttonY = (NAV_HEIGHT - BUTTON_HEIGHT) / 2;
+            int x = getWidth() - BUTTON_RIGHT;
+            for (int i = buttons.length - 1; i >= 0; i--) {
+                LegacyButton button = buttons[i];
+                if (button == null || !button.isVisible()) continue;
+                x -= BUTTON_WIDTH;
+                button.setBounds(x, buttonY, BUTTON_WIDTH, BUTTON_HEIGHT);
+                x -= BUTTON_GAP;
+            }
+        }
+
+        protected void paintComponent(Graphics g0) {
+            super.paintComponent(g0);
+            int textureWidth = getWidth() / 2 + 1;
+            int textureHeight = getHeight() / 2 + 1;
+            if (texturedBackground == null
+                    || texturedBackground.getWidth() != textureWidth
+                    || texturedBackground.getHeight() != textureHeight) {
+                texturedBackground = renderVanillaLauncherDirt(textureWidth, textureHeight);
+            }
+            g0.drawImage(
+                    texturedBackground,
+                    0,
+                    0,
+                    textureWidth * 2,
+                    textureHeight * 2,
+                    null);
+        }
+
+        private BufferedImage renderVanillaLauncherDirt(int width, int height) {
+            BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D g = image.createGraphics();
+            try {
+                if (dirtTile != null) {
+                    for (int x = 0; x <= width / TEXTURE_TILE_SIZE; x++) {
+                        for (int y = 0; y <= height / TEXTURE_TILE_SIZE; y++) {
+                            g.drawImage(dirtTile, x * TEXTURE_TILE_SIZE, y * TEXTURE_TILE_SIZE, null);
+                        }
+                    }
+                } else {
+                    g.setColor(getBackground());
+                    g.fillRect(0, 0, width, height);
+                }
+
+                // These are the exact overlays from vanilla TexturedPanel:
+                // a subtle light top edge followed by a bottom-darkening shade.
+                g.setPaint(new GradientPaint(
+                        0, 0, new Color(0x20FFFFFF, true),
+                        0, 1, new Color(0, true)));
+                g.fillRect(0, 0, width, 1);
+                g.setPaint(new GradientPaint(
+                        0, 0, new Color(0, true),
+                        0, height, new Color(0x60000000, true)));
+                g.fillRect(0, 0, width, height);
+            } finally {
+                g.dispose();
+            }
+            return image;
+        }
+    }
+
     // Abstraction for the progress UI so it can be shown either in its own
     // window or embedded as a second page inside the launcher.
     private interface ProgressUI {
@@ -4079,7 +4144,7 @@ public final class ModUpdaterGUI {
         }
         public void progress(int pct) { canvas.setProgress(Math.max(0.0, Math.min(1.0, pct / 100.0))); }
         public void setPhaseText(String text) { canvas.setPhase(text); }
-        public void log(String s) { canvas.setPhase(s); }
+        public void log(String s) { canvas.setSubtask(s); }
         void done() { canvas.setProgress(1.0); }
     }
 
@@ -4097,82 +4162,112 @@ public final class ModUpdaterGUI {
             canvas.setPhase(text);
         }
         public void log(String s) {
-            canvas.setPhase(s);
+            canvas.setSubtask(s);
         }
     }
 
     private static final class ProgressCanvas extends JPanel {
-        private BufferedImage bg;
-        private double progress = 0.0;
-        private String phase = "";
-        private final Color fg = new Color(202, 202, 202); // #CACACA
-        private final Color sub = new Color(202, 202, 202); // #CACACA
-        private final Color barBg = new Color(16, 16, 16);
-        private final Color barFill = new Color(44, 156, 6);
+        private static final int TEXTURE_TILE_SIZE = 32;
+
+        private final Image dirtTile;
+        private BufferedImage frameBuffer;
+        private int percentage;
+        private String phase = "Initializing loader";
+        private String subtask = "";
+
         ProgressCanvas(Path bgPath) {
-            setLayout(new BorderLayout());
             setOpaque(true);
-            setBackground(new Color(60, 43, 29));
-            if (bgPath != null && Files.isRegularFile(bgPath)) {
-                try { bg = ImageIO.read(bgPath.toFile()); } catch (Exception ignored) {}
-            }
+            setBackground(Color.BLACK);
+            BufferedImage dirt = loadLauncherDirtImage(bgPath);
+            this.dirtTile = dirt != null
+                    ? dirt.getScaledInstance(TEXTURE_TILE_SIZE, TEXTURE_TILE_SIZE, Image.SCALE_AREA_AVERAGING)
+                    : null;
         }
-        void setProgress(double f) { this.progress = f; repaint(); }
-        void setPhase(String s) { this.phase = s != null ? s : ""; repaint(); }
+
+        void setProgress(double progress) {
+            this.percentage = Math.max(0, Math.min(100, (int) Math.round(progress * 100.0)));
+            repaint();
+        }
+
+        void setPhase(String phase) {
+            this.phase = phase != null ? phase : "";
+            this.subtask = "";
+            repaint();
+        }
+
+        void setSubtask(String subtask) {
+            this.subtask = subtask != null ? subtask : "";
+            repaint();
+        }
+
         protected void paintComponent(Graphics g0) {
             super.paintComponent(g0);
-            Graphics2D g = (Graphics2D) g0;
-            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-            g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_OFF);
-            int w = getWidth();
-            int h = getHeight();
-            drawBackground(g, w, h, bg);
+            int width = getWidth() / 2;
+            int height = getHeight() / 2;
+            if (width <= 0 || height <= 0) return;
 
-            // Title - positioned to match original exactly
-            String title = "Updating Minecraft";
-            // Integer scaling using ceiling so text scales sooner when window grows
-            double layout = Math.min(w / 854.0, h / 480.0);
-            int kk = (int) Math.max(1, Math.ceil(layout - 1e-6));
-            Font base = UI_BASE_FONT != null ? UI_BASE_FONT : getFont();
-            BufferedImage titleImg = renderTextRaster(title, base.deriveFont(Font.BOLD, 30f), fg);
-            int tsw = titleImg.getWidth() * kk;
-            int tsh = titleImg.getHeight() * kk;
-            int tx = (w - tsw) / 2;
-            // Position title at ~30% from top like original
-            int ty = (int) Math.round(h * 0.30) - tsh / 2;
-            Object oldI = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-            g.drawImage(titleImg, tx, ty, tsw, tsh, null);
-            if (oldI != null) g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, oldI);
+            if (frameBuffer == null
+                    || frameBuffer.getWidth() != width
+                    || frameBuffer.getHeight() != height) {
+                frameBuffer = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+            }
 
-            // Phase text - centered vertically like original
-            String p = phase != null ? phase : "";
-            BufferedImage phaseImg = renderTextRaster(p, base.deriveFont(Font.PLAIN, 18f), sub);
-            int psw = phaseImg.getWidth() * kk;
-            int psh = phaseImg.getHeight() * kk;
-            int px = (w - psw) / 2;
-            // Position phase text at ~50% from top (center) like original
-            int py = (int) Math.round(h * 0.50) - psh / 2;
-            oldI = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-            g.drawImage(phaseImg, px, py, psw, psh, null);
-            if (oldI != null) g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, oldI);
+            Graphics2D g = frameBuffer.createGraphics();
+            try {
+                if (dirtTile != null) {
+                    for (int x = 0; x <= width / TEXTURE_TILE_SIZE; x++) {
+                        for (int y = 0; y <= height / TEXTURE_TILE_SIZE; y++) {
+                            g.drawImage(dirtTile, x * TEXTURE_TILE_SIZE, y * TEXTURE_TILE_SIZE, null);
+                        }
+                    }
+                } else {
+                    g.setColor(new Color(60, 43, 29));
+                    g.fillRect(0, 0, width, height);
+                }
 
-            // Progress bar: positioned at ~83% from top like original
-            int barW = Math.max(200 * kk, w - 160 * kk);
-            // Thin bar matching original
-            int barH = Math.max(4, 6 * kk);
-            int barX = (w - barW) / 2;
-            // Position at 83% from top like original
-            int barY = (int) Math.round(h * 0.83);
-            g.setColor(barBg);
-            g.fillRect(barX, barY, barW, barH);
-            int fill = (int) Math.round(barW * progress);
-            g.setColor(barFill);
-            g.fillRect(barX, barY, fill, barH);
-            g.setColor(Color.black);
-            g.drawRect(barX, barY, barW, barH);
+                g.setColor(Color.LIGHT_GRAY);
+                String message = "Updating Minecraft";
+                g.setFont(new Font(null, Font.BOLD, 20));
+                FontMetrics metrics = g.getFontMetrics();
+                g.drawString(
+                        message,
+                        width / 2 - metrics.stringWidth(message) / 2,
+                        height / 2 - metrics.getHeight() * 2);
+
+                g.setFont(new Font(null, Font.PLAIN, 12));
+                metrics = g.getFontMetrics();
+                message = phase != null ? phase : "";
+                g.drawString(
+                        message,
+                        width / 2 - metrics.stringWidth(message) / 2,
+                        height / 2 + metrics.getHeight());
+                message = subtask != null ? subtask : "";
+                g.drawString(
+                        message,
+                        width / 2 - metrics.stringWidth(message) / 2,
+                        height / 2 + metrics.getHeight() * 2);
+
+                int progressWidth = width - 128;
+                int completedWidth = percentage * progressWidth / 100;
+                g.setColor(Color.BLACK);
+                g.fillRect(64, height - 64, progressWidth + 1, 5);
+                g.setColor(new Color(32768));
+                g.fillRect(64, height - 64, completedWidth, 4);
+                g.setColor(new Color(2138144));
+                g.fillRect(65, height - 63, completedWidth - 2, 1);
+            } finally {
+                g.dispose();
+            }
+
+            Graphics2D screen = (Graphics2D) g0;
+            Object interpolation = screen.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
+            screen.setRenderingHint(
+                    RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            screen.drawImage(frameBuffer, 0, 0, width * 2, height * 2, null);
+            if (interpolation != null) {
+                screen.setRenderingHint(RenderingHints.KEY_INTERPOLATION, interpolation);
+            }
         }
     }
 
@@ -4209,6 +4304,36 @@ public final class ModUpdaterGUI {
         // Dev fallback
         Path p2 = Paths.get("tools", "mod-updater", "bg.png");
         if (Files.isRegularFile(p2)) return p2;
+        return null;
+    }
+
+    private static BufferedImage loadLauncherDirtImage(Path fallbackBgPath) {
+        InputStream resource = null;
+        try {
+            resource = ModUpdaterGUI.class.getResourceAsStream("/dirt.png");
+            if (resource != null) {
+                BufferedImage bundled = ImageIO.read(resource);
+                if (bundled != null) return bundled;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (resource != null) {
+                try { resource.close(); } catch (IOException ignored) {}
+            }
+        }
+
+        Path developmentCopy = Paths.get("src", "dirt.png");
+        if (Files.isRegularFile(developmentCopy)) {
+            try {
+                BufferedImage dirt = ImageIO.read(developmentCopy.toFile());
+                if (dirt != null) return dirt;
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (fallbackBgPath != null && Files.isRegularFile(fallbackBgPath)) {
+            try { return ImageIO.read(fallbackBgPath.toFile()); } catch (Exception ignored) {}
+        }
         return null;
     }
 
@@ -4657,7 +4782,7 @@ public final class ModUpdaterGUI {
             int w = getWidth();
             int h = getHeight();
 
-            int arc = 10; // slightly more curved corners
+            int arc = 4; // flatter corners, matching the classic Swing controls
 
             // Determine if this is the "primary" button (Options) and whether it's pressed
             boolean primary = Boolean.TRUE.equals(getClientProperty("primary"));

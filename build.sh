@@ -18,9 +18,12 @@ javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d out src/ModUpdater.
 echo "Compiling ModUpdaterGUI.java..."
 javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d out src/ModUpdaterGUI.java src/LauncherBootstrap.java
 
-# Copy bg.png resource to output (if needed by GUI)
+# Copy image resources to output (if needed by GUI)
 if [ -f src/bg.png ]; then
     cp src/bg.png out/bg.png
+fi
+if [ -f src/dirt.png ]; then
+    cp src/dirt.png out/dirt.png
 fi
 
 # Create CLI jar
@@ -35,4 +38,3 @@ echo ""
 echo "Build complete!"
 echo "  - mod-updater.jar (CLI)"
 echo "  - mod-updater-gui.jar (GUI)"
-

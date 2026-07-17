@@ -56,10 +56,14 @@ if ! javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -d out src/Launch
     exit 1
 fi
 
-# Copy bg.png resource to output (if needed by GUI)
+# Copy image resources to output (if needed by GUI)
 if [[ -f src/bg.png ]]; then
     echo "Copying bg.png resource..."
     cp src/bg.png out/bg.png
+fi
+if [[ -f src/dirt.png ]]; then
+    echo "Copying dirt.png resource..."
+    cp src/dirt.png out/dirt.png
 fi
 
 # Create CLI jar

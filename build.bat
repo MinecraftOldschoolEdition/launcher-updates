@@ -32,8 +32,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Copy bg.png resource to output (if needed by GUI)
+REM Copy image resources to output (if needed by GUI)
 if exist src/bg.png copy src/bg.png out\bg.png >nul 2>&1
+if exist src/dirt.png copy src/dirt.png out\dirt.png >nul 2>&1
 
 REM Create CLI jar
 echo Creating mod-updater.jar...
