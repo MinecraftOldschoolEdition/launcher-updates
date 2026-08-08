@@ -13,9 +13,9 @@ Cross‑platform updater for Prism Launcher / MultiMC instances or simple batch 
 
 ## Resource Sync Behavior
 
-- Incremental sync (normal launch): periodically checks the selected resource-pack branch and persists its last successful commit/tree in `resources/.mcose-resource-sync.properties`.
+- Incremental sync (normal launch): checks the selected resource-pack branch commit and persists its last successful commit/tree in `resources/.mcose-resource-sync.properties`.
 - When that commit changes, only added or changed files are downloaded; files removed upstream are deleted only when the persisted manifest proves they belonged to the resource repository.
-- Unchanged commits download no resources. Checks are throttled by `resourcePackCheckIntervalMinutes` (default: 60; set to `0` to check every launch).
+- The lightweight commit check runs on every normal launch, so new language or asset commits are detected immediately. When the commit is unchanged, `resourcePackCheckIntervalMinutes` throttles only the local missing-file integrity scan (default: 60; set to `0` to scan every launch).
 - Choosing `Not now` for a game update skips the resource repository check and all resource downloads for that launch.
 - Console output reports why resource downloads were skipped; when downloads run, it lists every queued and completed incremental file (and every file installed by a full refresh).
 - Full sync (Force update + Yes): refreshes all resource files.

@@ -137,7 +137,7 @@ import java.util.zip.ZipFile;
  * --newsUrl <url>      URL for embedded news/patch notes page
  * --resourcePackBranch <branch> Stable resource sync branch (default: main)
  * --resourcePackBetaBranch <branch> Beta resource sync branch (default: beta)
- * --resourcePackCheckIntervalMinutes <minutes> Delay between incremental checks (default: 60)
+ * --resourcePackCheckIntervalMinutes <minutes> Delay between unchanged-commit local scans (default: 60)
  * 
  * =============================================================================
  * CONFIGURATION FILE (updater.properties)
@@ -235,7 +235,7 @@ public final class ModUpdaterGUI {
     /** Maximum per-run detailed resource file log lines for each category. */
     private static final int RESOURCE_SYNC_DETAIL_LOG_LIMIT = 120;
 
-    /** Default delay between resource repository checks. */
+    /** Default delay between local integrity scans when the remote commit is unchanged. */
     private static final long DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES = 60L;
 
     /** Persisted remote resource tree used to calculate incremental changes. */
@@ -459,7 +459,7 @@ public final class ModUpdaterGUI {
             state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
             state.resourcePackBranch = resourcePackBranch; // Stable resource pack branch
             state.resourcePackBetaBranch = resourcePackBetaBranch; // Beta resource pack branch
-            state.resourcePackCheckIntervalMs = resourcePackCheckIntervalMs; // Minimum delay between repository checks
+            state.resourcePackCheckIntervalMs = resourcePackCheckIntervalMs; // Delay between unchanged-commit local scans
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             state.launchArgs = args != null ? (String[]) args.clone() : new String[0];
             
@@ -2429,7 +2429,8 @@ public final class ModUpdaterGUI {
      * Syncs the resource pack from a repository using either smart or full mode.
      *
      * Smart mode:
-     * - Checks the repository no more often than the configured interval
+     * - Checks the lightweight branch commit ref on every normal launch
+     * - Defers only the local integrity scan when that commit is unchanged
      * - Downloads only remotely added or changed files
      * - Removes files deleted from the remote tree when they were tracked previously
      *
@@ -2561,21 +2562,6 @@ public final class ModUpdaterGUI {
         long now = System.currentTimeMillis();
 
         result.sourceBranch = branch;
-        if (hasMatchingManifest
-                && checkIntervalMs > 0L
-                && previous.checkedAt > 0L
-                && now >= previous.checkedAt
-                && now - previous.checkedAt < checkIntervalMs) {
-            result.success = true;
-            result.checkDeferred = true;
-            result.sourceCommit = previous.commit;
-            result.unchangedFiles = previous.files.size();
-            long remainingMs = checkIntervalMs - (now - previous.checkedAt);
-            System.out.println("[mod-updater] Resource download skipped: repository check is not due for another "
-                    + Math.max(1L, (remainingMs + 59999L) / 60000L) + " minute(s); no resource request was made.");
-            return result;
-        }
-
         ResourcePackRef remoteRef = fetchResourcePackRef(repo, branch, result);
         branch = remoteRef.branch;
         hasMatchingManifest = previous != null && previous.matches(repo, branch);
@@ -2583,9 +2569,28 @@ public final class ModUpdaterGUI {
         result.sourceBranch = branch;
         String commit = remoteRef.commit;
         result.sourceCommit = commit;
+        System.out.println("[mod-updater] Resource commit check: tracked="
+                + (hasMatchingManifest ? shortSha(previous.commit) : "none")
+                + ", remote=" + shortSha(commit) + ", branch=" + branch + ".");
+
+        boolean commitUnchanged = hasMatchingManifest && equalsSafe(previous.commit, commit);
+        if (commitUnchanged
+                && checkIntervalMs > 0L
+                && previous.checkedAt > 0L
+                && now >= previous.checkedAt
+                && now - previous.checkedAt < checkIntervalMs) {
+            result.success = true;
+            result.checkDeferred = true;
+            result.unchangedFiles = previous.files.size();
+            long remainingMs = checkIntervalMs - (now - previous.checkedAt);
+            System.out.println("[mod-updater] Resource download skipped: remote commit is unchanged; local integrity scan"
+                    + " is not due for another " + Math.max(1L, (remainingMs + 59999L) / 60000L)
+                    + " minute(s). Only commit metadata was fetched.");
+            return result;
+        }
 
         ResourcePackRemoteTree remote;
-        if (hasMatchingManifest && equalsSafe(previous.commit, commit)) {
+        if (commitUnchanged) {
             List<String> missingTrackedFiles = findMissingTrackedResourceFiles(previous, minecraftDir);
             if (missingTrackedFiles.isEmpty()) {
                 previous.checkedAt = now;
