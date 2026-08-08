@@ -28,12 +28,14 @@ import java.awt.event.KeyEvent;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.ProtocolException;
+import java.net.URLEncoder;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
@@ -135,6 +137,7 @@ import java.util.zip.ZipFile;
  * --newsUrl <url>      URL for embedded news/patch notes page
  * --resourcePackBranch <branch> Stable resource sync branch (default: main)
  * --resourcePackBetaBranch <branch> Beta resource sync branch (default: beta)
+ * --resourcePackCheckIntervalMinutes <minutes> Delay between incremental checks (default: 60)
  * 
  * =============================================================================
  * CONFIGURATION FILE (updater.properties)
@@ -150,6 +153,7 @@ import java.util.zip.ZipFile;
  *   launcherRepo=YourOrg/launcher-updates
  *   resourcePackBranch=main
  *   resourcePackBetaBranch=beta
+ *   resourcePackCheckIntervalMinutes=60
  * 
  * @author Minecraft Oldschool Edition Team
  * @see ModUpdater CLI version of this updater
@@ -230,6 +234,12 @@ public final class ModUpdaterGUI {
     
     /** Maximum per-run detailed resource file log lines for each category. */
     private static final int RESOURCE_SYNC_DETAIL_LOG_LIMIT = 120;
+
+    /** Default delay between resource repository checks. */
+    private static final long DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES = 60L;
+
+    /** Persisted remote resource tree used to calculate incremental changes. */
+    private static final String RESOURCE_SYNC_MANIFEST_NAME = ".mcose-resource-sync.properties";
     
     /** GitHub API endpoint template for fetching the latest release from a repository */
     private static final String GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest";
@@ -377,6 +387,8 @@ public final class ModUpdaterGUI {
             String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
             String resourcePackBranch = value(cli, cfg, "resourcePackBranch", "main");
             String resourcePackBetaBranch = value(cli, cfg, "resourcePackBetaBranch", "beta");
+            long resourcePackCheckIntervalMs = parseResourcePackCheckIntervalMillis(
+                    value(cli, cfg, "resourcePackCheckIntervalMinutes", Long.toString(DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES)));
 
             // =================================================================
             // STEP 4: Resolve Directory Paths
@@ -447,6 +459,7 @@ public final class ModUpdaterGUI {
             state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
             state.resourcePackBranch = resourcePackBranch; // Stable resource pack branch
             state.resourcePackBetaBranch = resourcePackBetaBranch; // Beta resource pack branch
+            state.resourcePackCheckIntervalMs = resourcePackCheckIntervalMs; // Minimum delay between repository checks
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             state.launchArgs = args != null ? (String[]) args.clone() : new String[0];
             
@@ -471,7 +484,8 @@ public final class ModUpdaterGUI {
             if ("--config".equals(a) || "--repo".equals(a) || "--betaRepo".equals(a) || "--jarRegex".equals(a) || "--serverJarRegex".equals(a) || "--assetsRegex".equals(a)
                 || "--minecraftDir".equals(a) || "--instanceDir".equals(a) || "--mode".equals(a)
                 || "--jarmodName".equals(a) || "--newsUrl".equals(a)
-                || "--resourcePackRepo".equals(a) || "--resourcePackBranch".equals(a) || "--resourcePackBetaBranch".equals(a)) {
+                || "--resourcePackRepo".equals(a) || "--resourcePackBranch".equals(a) || "--resourcePackBetaBranch".equals(a)
+                || "--resourcePackCheckIntervalMinutes".equals(a)) {
                 if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + a);
                 map.put(a, args[++i]);
             } else {
@@ -522,6 +536,7 @@ public final class ModUpdaterGUI {
         sb.append("resourcePackRepo=MinecraftOldschoolEdition/resourcepack").append(newline);
         sb.append("resourcePackBranch=main").append(newline);
         sb.append("resourcePackBetaBranch=beta").append(newline);
+        sb.append("resourcePackCheckIntervalMinutes=").append(DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES).append(newline);
         Files.write(configPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -536,6 +551,27 @@ public final class ModUpdaterGUI {
         if (regex == null) return null;
         String trimmed = regex.trim();
         return trimmed.length() == 0 ? null : trimmed;
+    }
+
+    private static long parseResourcePackCheckIntervalMillis(String value) {
+        long minutes = DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES;
+        if (value != null) {
+            try {
+                minutes = Long.parseLong(value.trim());
+            } catch (NumberFormatException badValue) {
+                System.err.println("[mod-updater] Invalid resourcePackCheckIntervalMinutes='" + value
+                        + "'; using " + DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES + " minutes.");
+            }
+        }
+        if (minutes < 0L) {
+            System.err.println("[mod-updater] resourcePackCheckIntervalMinutes cannot be negative; using "
+                    + DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES + " minutes.");
+            minutes = DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES;
+        }
+        if (minutes > Long.MAX_VALUE / 60000L) {
+            return Long.MAX_VALUE;
+        }
+        return minutes * 60000L;
     }
     
     // Canonical news URL - all old URLs should redirect here
@@ -684,6 +720,7 @@ public final class ModUpdaterGUI {
         String resourcePackRepo;
         String resourcePackBranch;
         String resourcePackBetaBranch;
+        long resourcePackCheckIntervalMs;
         Path minecraftDir;
         String[] launchArgs;
     }
@@ -737,15 +774,25 @@ public final class ModUpdaterGUI {
         boolean success;
         String sourceUrl;
         String sourceBranch;
+        String sourceCommit;
         ResourceSyncMode mode;
+        boolean checkDeferred;
         int copiedFiles;
         int langFilesRefreshed;
         int missingFilesCopied;
         int skippedExistingFiles;
+        int changedFilesDownloaded;
+        int addedFilesDownloaded;
+        int removedFiles;
+        int unchangedFiles;
         final List<String> missingAssetDetails = new ArrayList<String>();
         final List<String> refreshedLanguageDetails = new ArrayList<String>();
+        final List<String> changedAssetDetails = new ArrayList<String>();
+        final List<String> removedAssetDetails = new ArrayList<String>();
         int suppressedMissingDetails;
         int suppressedLanguageDetails;
+        int suppressedChangedDetails;
+        int suppressedRemovedDetails;
         final List<String> attempts = new ArrayList<String>();
         final List<String> errors = new ArrayList<String>();
         
@@ -764,6 +811,24 @@ public final class ModUpdaterGUI {
                 refreshedLanguageDetails.add(path);
             } else {
                 suppressedLanguageDetails++;
+            }
+        }
+
+        void addChangedAssetDetail(String path) {
+            if (path == null) return;
+            if (changedAssetDetails.size() < RESOURCE_SYNC_DETAIL_LOG_LIMIT) {
+                changedAssetDetails.add(path);
+            } else {
+                suppressedChangedDetails++;
+            }
+        }
+
+        void addRemovedAssetDetail(String path) {
+            if (path == null) return;
+            if (removedAssetDetails.size() < RESOURCE_SYNC_DETAIL_LOG_LIMIT) {
+                removedAssetDetails.add(path);
+            } else {
+                suppressedRemovedDetails++;
             }
         }
         
@@ -839,6 +904,7 @@ public final class ModUpdaterGUI {
         if (jarAsset == null) {
             System.out.println("[mod-updater] No patch jar asset matched jarRegex '" + jarRegex + "' in repo " + repo + "; skipping client patch install for this release.");
         }
+
         ReleaseAsset serverJarAsset = selectOptionalAsset(latest.assets, serverJarRegex);
         if (serverJarRegex != null && serverJarAsset == null) {
             System.out.println("[mod-updater] No server jar asset matched serverJarRegex '" + serverJarRegex + "' in repo " + repo + "; skipping LAN server install for this release.");
@@ -1184,6 +1250,33 @@ public final class ModUpdaterGUI {
         }
     }
 
+    private static final class ResourcePackManifest {
+        String repo;
+        String branch;
+        String commit;
+        long checkedAt;
+        final Map<String, String> files = new LinkedHashMap<String, String>();
+
+        boolean matches(String expectedRepo, String expectedBranch) {
+            return equalsSafe(repo, expectedRepo) && equalsSafe(branch, expectedBranch);
+        }
+    }
+
+    private static final class ResourcePackRemoteTree {
+        String commit;
+        final Map<String, String> files = new LinkedHashMap<String, String>();
+    }
+
+    private static final class ResourcePackRef {
+        final String branch;
+        final String commit;
+
+        ResourcePackRef(String branch, String commit) {
+            this.branch = branch;
+            this.commit = commit;
+        }
+    }
+
     /**
      * Launcher-style window that embeds a patch-notes "web page" and a dirt
      * bottom bar with Play / Options buttons. When an update is available,
@@ -1462,7 +1555,8 @@ public final class ModUpdaterGUI {
                                                 currentResourcePackBranch(launcherState),
                                                 launcherState.minecraftDir,
                                                 ResourceSyncMode.SMART,
-                                                false);
+                                                false,
+                                                launcherState.resourcePackCheckIntervalMs);
                                         logResourceSyncResult(syncResult);
                                     }
                                     // Install macOS patches if needed
@@ -1548,7 +1642,8 @@ public final class ModUpdaterGUI {
                                                 currentResourcePackBranch(launcherState),
                                                 launcherState.minecraftDir,
                                                 syncMode,
-                                                strictSync);
+                                                strictSync,
+                                                launcherState.resourcePackCheckIntervalMs);
                                         logResourceSyncResult(syncResult);
                                         // Install macOS patches if needed
                                         installMacOSPatch(launcherState.instanceRoot);
@@ -1578,7 +1673,8 @@ public final class ModUpdaterGUI {
                         if (startMandatoryLauncherSelfUpdate(frame, launcherState, cardPanel, cards, bottomBg, root, progressCanvas)) {
                             return;
                         }
-                        // Show update screen and sync resource pack before launching
+                        // The user declined the game update. Do not contact the resource-pack
+                        // repository during this launch; refusal applies to the whole update pass.
                         cards.show(cardPanel, "update");
                         root.revalidate();
                         root.repaint();
@@ -1586,17 +1682,9 @@ public final class ModUpdaterGUI {
                         Thread t = new Thread(new Runnable() {
                             public void run() {
                                 try {
-                                    if (launcherState != null && launcherState.resourcePackRepo != null) {
-                                        ui.setPhaseText("Syncing resource pack...");
-                                        ui.progress(10);
-                                        ResourceSyncResult syncResult = syncResourcePack(
-                                                launcherState.resourcePackRepo,
-                                                currentResourcePackBranch(launcherState),
-                                                launcherState.minecraftDir,
-                                                ResourceSyncMode.SMART,
-                                                false);
-                                        logResourceSyncResult(syncResult);
-                                    }
+                                    ui.setPhaseText("Starting Minecraft...");
+                                    ui.progress(10);
+                                    System.out.println("[mod-updater] Game update declined; skipping resource repository check for this launch.");
                                     // Install macOS patches if needed
                                     if (launcherState != null) {
                                         installMacOSPatch(launcherState.instanceRoot);
@@ -1611,7 +1699,7 @@ public final class ModUpdaterGUI {
                                     System.exit(1);
                                 }
                             }
-                        }, "ModUpdater-ResourcePackSync");
+                        }, "ModUpdater-DeclinedUpdateLaunch");
                         t.setDaemon(false);
                         t.start();
                     }
@@ -2341,8 +2429,9 @@ public final class ModUpdaterGUI {
      * Syncs the resource pack from a repository using either smart or full mode.
      *
      * Smart mode:
-     * - Always refreshes files under assets/minecraft/lang/
-     * - Copies all other assets only when they are missing locally
+     * - Checks the repository no more often than the configured interval
+     * - Downloads only remotely added or changed files
+     * - Removes files deleted from the remote tree when they were tracked previously
      *
      * Full mode:
      * - Replaces every asset file from the archive
@@ -2356,6 +2445,17 @@ public final class ModUpdaterGUI {
      * @throws IOException when strict mode is enabled and sync fails
      */
     private static ResourceSyncResult syncResourcePack(String repo, String branch, Path minecraftDir, ResourceSyncMode mode, boolean strict) throws IOException {
+        return syncResourcePack(repo, branch, minecraftDir, mode, strict,
+                DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES * 60000L);
+    }
+
+    private static ResourceSyncResult syncResourcePack(
+            String repo,
+            String branch,
+            Path minecraftDir,
+            ResourceSyncMode mode,
+            boolean strict,
+            long checkIntervalMs) throws IOException {
         ResourceSyncResult result = new ResourceSyncResult();
         result.mode = mode != null ? mode : ResourceSyncMode.SMART;
         
@@ -2364,7 +2464,7 @@ public final class ModUpdaterGUI {
                 System.err.println("[mod-updater] Resource sync: missing resourcePackRepo; strict mode requires a full sync.");
                 throw new IOException("Resource pack repository is not configured.");
             }
-            System.err.println("[mod-updater] Resource sync skipped: resourcePackRepo is not configured.");
+            System.err.println("[mod-updater] Resource download skipped: resourcePackRepo is not configured.");
             result.success = true;
             return result;
         }
@@ -2373,7 +2473,7 @@ public final class ModUpdaterGUI {
                 System.err.println("[mod-updater] Resource sync: missing minecraftDir; strict mode requires a full sync.");
                 throw new IOException("Minecraft directory is not available for resource sync.");
             }
-            System.err.println("[mod-updater] Resource sync skipped: minecraftDir is unavailable.");
+            System.err.println("[mod-updater] Resource download skipped: minecraftDir is unavailable.");
             result.success = true;
             return result;
         }
@@ -2382,7 +2482,23 @@ public final class ModUpdaterGUI {
         String effectiveBranch = normalizeResourcePackBranch(branch);
         System.out.println("[mod-updater] Syncing resource pack from: " + repoTrimmed + " (branch=" + effectiveBranch + ", mode=" + result.mode + ")");
         if (result.mode == ResourceSyncMode.SMART) {
-            System.out.println("[mod-updater] Smart sync policy: refresh language files and restore only missing non-language assets.");
+            System.out.println("[mod-updater] Incremental sync policy: download remote additions/changes and remove tracked remote deletions only.");
+            try {
+                return syncResourcePackIncrementally(
+                        repoTrimmed,
+                        effectiveBranch,
+                        minecraftDir,
+                        Math.max(0L, checkIntervalMs),
+                        result);
+            } catch (IOException e) {
+                String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                result.errors.add(msg);
+                if (strict) {
+                    throw new IOException("Incremental resource pack sync failed in strict mode: " + msg, e);
+                }
+                System.err.println("[mod-updater] Warning: Failed to sync resource pack incrementally: " + msg);
+                return result;
+            }
         } else {
             System.out.println("[mod-updater] Full sync policy: re-download and replace all resource-pack assets.");
         }
@@ -2404,6 +2520,16 @@ public final class ModUpdaterGUI {
             result.sourceBranch = archive.branch;
             System.out.println("[mod-updater] Resource sync: downloaded archive from " + archive.url + " (branch=" + archive.branch + "), applying fixes...");
             extractResourcePackArchive(archive.zipPath, minecraftDir, result.mode, result);
+            String archiveUrl = result.sourceUrl;
+            try {
+                recordFullResourcePackState(repoTrimmed, archive.branch, minecraftDir, result);
+            } catch (IOException manifestFailure) {
+                // The full archive has already been applied. Keep any prior manifest so
+                // the next incremental pass can retry reconciliation safely.
+                System.err.println("[mod-updater] Full resource sync completed, but incremental state could not be refreshed: "
+                        + manifestFailure.getMessage());
+            }
+            result.sourceUrl = archiveUrl;
             result.success = true;
             return result;
         } catch (IOException e) {
@@ -2421,24 +2547,586 @@ public final class ModUpdaterGUI {
             }
         }
     }
-    
+
+    private static ResourceSyncResult syncResourcePackIncrementally(
+            String repo,
+            String branch,
+            Path minecraftDir,
+            long checkIntervalMs,
+            ResourceSyncResult result) throws IOException {
+        Path manifestPath = resourcePackManifestPath(minecraftDir);
+        ResourcePackManifest previous = readResourcePackManifest(manifestPath);
+        boolean hasTrackedManifest = previous != null && equalsSafe(previous.repo, repo);
+        boolean hasMatchingManifest = previous != null && previous.matches(repo, branch);
+        long now = System.currentTimeMillis();
+
+        result.sourceBranch = branch;
+        if (hasMatchingManifest
+                && checkIntervalMs > 0L
+                && previous.checkedAt > 0L
+                && now >= previous.checkedAt
+                && now - previous.checkedAt < checkIntervalMs) {
+            result.success = true;
+            result.checkDeferred = true;
+            result.sourceCommit = previous.commit;
+            result.unchangedFiles = previous.files.size();
+            long remainingMs = checkIntervalMs - (now - previous.checkedAt);
+            System.out.println("[mod-updater] Resource download skipped: repository check is not due for another "
+                    + Math.max(1L, (remainingMs + 59999L) / 60000L) + " minute(s); no resource request was made.");
+            return result;
+        }
+
+        ResourcePackRef remoteRef = fetchResourcePackRef(repo, branch, result);
+        branch = remoteRef.branch;
+        hasMatchingManifest = previous != null && previous.matches(repo, branch);
+        hasTrackedManifest = previous != null && equalsSafe(previous.repo, repo);
+        result.sourceBranch = branch;
+        String commit = remoteRef.commit;
+        result.sourceCommit = commit;
+
+        ResourcePackRemoteTree remote;
+        if (hasMatchingManifest && equalsSafe(previous.commit, commit)) {
+            List<String> missingTrackedFiles = findMissingTrackedResourceFiles(previous, minecraftDir);
+            if (missingTrackedFiles.isEmpty()) {
+                previous.checkedAt = now;
+                writeResourcePackManifest(manifestPath, previous);
+                result.success = true;
+                result.unchangedFiles = previous.files.size();
+                System.out.println("[mod-updater] Resource download skipped: repository commit is unchanged ("
+                        + shortSha(commit) + "); no resource files need updating.");
+                return result;
+            }
+            remote = new ResourcePackRemoteTree();
+            remote.commit = commit;
+            remote.files.putAll(previous.files);
+            System.out.println("[mod-updater] Remote commit is unchanged, but " + missingTrackedFiles.size()
+                    + " tracked local resource file(s) are missing and will be restored.");
+        } else {
+            remote = fetchResourcePackTree(repo, branch, commit, result);
+        }
+
+        Map<String, Boolean> filesToDownload = new LinkedHashMap<String, Boolean>();
+        for (Map.Entry<String, String> entry : remote.files.entrySet()) {
+            String relativePath = entry.getKey();
+            String remoteSha = entry.getValue();
+            Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
+            if (destination == null) continue;
+
+            String previousSha = hasTrackedManifest ? previous.files.get(relativePath) : null;
+            boolean exists = Files.isRegularFile(destination);
+            boolean added = previousSha == null;
+            boolean needsDownload;
+
+            if (hasTrackedManifest) {
+                needsDownload = !exists || !equalsSafe(previousSha, remoteSha);
+            } else if (!exists) {
+                needsDownload = true;
+            } else {
+                needsDownload = !equalsSafe(computeGitBlobSha(destination), remoteSha);
+            }
+
+            if (needsDownload) {
+                filesToDownload.put(relativePath, Boolean.valueOf(added));
+            } else {
+                result.unchangedFiles++;
+            }
+        }
+
+        if (filesToDownload.isEmpty()) {
+            System.out.println("[mod-updater] Resource download skipped: repository scan found no added, changed, or missing files"
+                    + " (unchanged=" + result.unchangedFiles + ").");
+        } else {
+            System.out.println("[mod-updater] Resource download required for " + filesToDownload.size() + " file(s):");
+            for (Map.Entry<String, Boolean> change : filesToDownload.entrySet()) {
+                String relativePath = change.getKey();
+                Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
+                String reason = Boolean.TRUE.equals(change.getValue())
+                        ? "ADDED"
+                        : destination != null && Files.isRegularFile(destination) ? "CHANGED" : "RESTORE";
+                System.out.println("[mod-updater]   [" + reason + "] " + relativePath
+                        + " (blob=" + shortSha(remote.files.get(relativePath)) + ")");
+            }
+        }
+
+        for (Map.Entry<String, Boolean> change : filesToDownload.entrySet()) {
+            String relativePath = change.getKey();
+            String blobSha = remote.files.get(relativePath);
+            Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
+            if (destination == null) {
+                throw new IOException("Unsafe resource path returned by GitHub: " + relativePath);
+            }
+            boolean existedBefore = Files.isRegularFile(destination);
+            System.out.println("[mod-updater] Downloading resource file: " + relativePath);
+            downloadResourcePackBlob(repo, commit, relativePath, blobSha, destination, result);
+            System.out.println("[mod-updater] Downloaded resource file: " + relativePath
+                    + " (blob=" + shortSha(blobSha) + ")");
+            result.copiedFiles++;
+
+            if (Boolean.TRUE.equals(change.getValue()) || !existedBefore) {
+                result.addedFilesDownloaded++;
+                result.missingFilesCopied++;
+                result.addMissingAssetDetail(relativePath);
+            } else {
+                result.changedFilesDownloaded++;
+                result.addChangedAssetDetail(relativePath);
+            }
+            if (isLanguageAssetPath(relativePath)) {
+                result.langFilesRefreshed++;
+                result.addRefreshedLanguageDetail(relativePath);
+            }
+        }
+
+        if (hasTrackedManifest) {
+            for (String previousPath : previous.files.keySet()) {
+                if (remote.files.containsKey(previousPath)) continue;
+                Path destination = resolveResourcePackDestination(minecraftDir, previousPath);
+                if (destination == null) continue;
+                if (Files.deleteIfExists(destination)) {
+                    System.out.println("[mod-updater] Removed resource file deleted upstream: " + previousPath);
+                    result.removedFiles++;
+                    result.addRemovedAssetDetail(previousPath);
+                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources").resolve("assets"));
+                }
+            }
+        }
+
+        ResourcePackManifest updated = new ResourcePackManifest();
+        updated.repo = repo;
+        updated.branch = branch;
+        updated.commit = commit;
+        updated.checkedAt = now;
+        updated.files.putAll(remote.files);
+        writeResourcePackManifest(manifestPath, updated);
+
+        result.success = true;
+        System.out.println("[mod-updater] Incremental resource sync applied commit " + shortSha(commit)
+                + ": added=" + result.addedFilesDownloaded
+                + ", changed=" + result.changedFilesDownloaded
+                + ", removed=" + result.removedFiles
+                + ", unchanged=" + result.unchangedFiles + ".");
+        return result;
+    }
+
+    private static void recordFullResourcePackState(
+            String repo,
+            String branch,
+            Path minecraftDir,
+            ResourceSyncResult result) throws IOException {
+        Path manifestPath = resourcePackManifestPath(minecraftDir);
+        ResourcePackManifest previous = readResourcePackManifest(manifestPath);
+        ResourcePackRef remoteRef = fetchResourcePackRef(repo, branch, result);
+        ResourcePackRemoteTree remote = fetchResourcePackTree(repo, remoteRef.branch, remoteRef.commit, result);
+
+        // Ensure the archive and metadata describe the same content before recording
+        // the commit. A branch push racing the archive download will be retried later.
+        for (Map.Entry<String, String> entry : remote.files.entrySet()) {
+            Path destination = resolveResourcePackDestination(minecraftDir, entry.getKey());
+            if (destination == null
+                    || !Files.isRegularFile(destination)
+                    || !equalsSafe(computeGitBlobSha(destination), entry.getValue())) {
+                throw new IOException("Resource archive did not match current branch commit at " + entry.getKey() + ".");
+            }
+        }
+
+        if (previous != null && equalsSafe(previous.repo, repo)) {
+            for (String previousPath : previous.files.keySet()) {
+                if (remote.files.containsKey(previousPath)) continue;
+                Path destination = resolveResourcePackDestination(minecraftDir, previousPath);
+                if (destination != null && Files.deleteIfExists(destination)) {
+                    result.removedFiles++;
+                    result.addRemovedAssetDetail(previousPath);
+                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources").resolve("assets"));
+                }
+            }
+        }
+
+        ResourcePackManifest updated = new ResourcePackManifest();
+        updated.repo = repo;
+        updated.branch = remoteRef.branch;
+        updated.commit = remoteRef.commit;
+        updated.checkedAt = System.currentTimeMillis();
+        updated.files.putAll(remote.files);
+        writeResourcePackManifest(manifestPath, updated);
+        result.sourceBranch = remoteRef.branch;
+        result.sourceCommit = remoteRef.commit;
+    }
+
+    private static String fetchResourcePackCommit(String repo, String branch, ResourceSyncResult result) throws IOException {
+        String url = "https://api.github.com/repos/" + repo + "/git/ref/heads/" + encodeUrlPath(branch);
+        String json = fetchGitHubJson(url, result, "commit");
+        String commit = extractString(json, "\\\"sha\\\"\\s*:\\s*\\\"([0-9a-fA-F]{40})\\\"");
+        if (commit == null) {
+            throw new IOException("GitHub commit response did not contain a commit SHA for branch '" + branch + "'.");
+        }
+        result.sourceUrl = url;
+        return commit.toLowerCase(Locale.ROOT);
+    }
+
+    private static ResourcePackRef fetchResourcePackRef(String repo, String preferredBranch, ResourceSyncResult result) throws IOException {
+        try {
+            return new ResourcePackRef(preferredBranch, fetchResourcePackCommit(repo, preferredBranch, result));
+        } catch (IOException preferredFailure) {
+            if (!"main".equalsIgnoreCase(preferredBranch)
+                    || preferredFailure.getMessage() == null
+                    || preferredFailure.getMessage().indexOf("HTTP 404") < 0) {
+                throw preferredFailure;
+            }
+            System.err.println("[mod-updater] Resource branch 'main' was not found; trying legacy branch 'master'.");
+            try {
+                return new ResourcePackRef("master", fetchResourcePackCommit(repo, "master", result));
+            } catch (IOException fallbackFailure) {
+                fallbackFailure.addSuppressed(preferredFailure);
+                throw fallbackFailure;
+            }
+        }
+    }
+
+    private static ResourcePackRemoteTree fetchResourcePackTree(
+            String repo,
+            String branch,
+            String commit,
+            ResourceSyncResult result) throws IOException {
+        String url = "https://api.github.com/repos/" + repo + "/git/trees/" + encodeUrlComponent(commit) + "?recursive=1";
+        String json = fetchGitHubJson(url, result, "tree");
+        if (Pattern.compile("\\\"truncated\\\"\\s*:\\s*true", Pattern.CASE_INSENSITIVE).matcher(json).find()) {
+            throw new IOException("GitHub truncated the resource repository tree; refusing to apply an incomplete delta.");
+        }
+
+        int treeKey = json.indexOf("\"tree\"");
+        int arrayStart = treeKey >= 0 ? json.indexOf('[', treeKey) : -1;
+        int arrayEnd = arrayStart >= 0 ? findMatchingBracket(json, arrayStart) : -1;
+        if (arrayStart < 0 || arrayEnd < 0) {
+            throw new IOException("GitHub tree response did not contain a complete tree array.");
+        }
+
+        ResourcePackRemoteTree remote = new ResourcePackRemoteTree();
+        remote.commit = commit;
+        int cursor = arrayStart + 1;
+        while (cursor < arrayEnd) {
+            int objectStart = json.indexOf('{', cursor);
+            if (objectStart < 0 || objectStart >= arrayEnd) break;
+            int objectEnd = findMatchingBrace(json, objectStart);
+            if (objectEnd < 0 || objectEnd > arrayEnd) {
+                throw new IOException("GitHub tree response contained an incomplete entry.");
+            }
+            String object = json.substring(objectStart, objectEnd + 1);
+            String type = extractString(object, "\\\"type\\\"\\s*:\\s*\\\"(.*?)\\\"");
+            String path = extractString(object, "\\\"path\\\"\\s*:\\s*\\\"(.*?)\\\"");
+            String sha = extractString(object, "\\\"sha\\\"\\s*:\\s*\\\"([0-9a-fA-F]{40})\\\"");
+            if ("blob".equals(type) && sha != null && isSafeResourcePackPath(path)) {
+                remote.files.put(path.replace('\\', '/'), sha.toLowerCase(Locale.ROOT));
+            }
+            cursor = objectEnd + 1;
+        }
+        result.sourceUrl = url;
+        System.out.println("[mod-updater] Resource repository tree at " + shortSha(commit)
+                + " contains " + remote.files.size() + " asset file(s).");
+        return remote;
+    }
+
+    private static String fetchGitHubJson(String url, ResourceSyncResult result, String label) throws IOException {
+        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Accept", "application/vnd.github+json");
+        String token = getenv("GITHUB_TOKEN");
+        if (token != null && !token.trim().isEmpty()) {
+            conn.setRequestProperty("Authorization", "token " + token.trim());
+        }
+        int code = conn.getResponseCode();
+        InputStream in = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
+        String body = readAll(in);
+        if (code < 200 || code >= 300) {
+            String failure = label + " metadata -> HTTP " + code + " " + truncateErrorBody(body);
+            if (result != null) result.attempts.add(url + " -> FAIL: " + failure);
+            throw new IOException("GitHub resource " + failure);
+        }
+        if (result != null) result.attempts.add(url + " -> OK");
+        return body;
+    }
+
+    private static void downloadResourcePackBlob(
+            String repo,
+            String commit,
+            String relativePath,
+            String expectedBlobSha,
+            Path destination,
+            ResourceSyncResult result) throws IOException {
+        ensureDir(destination.getParent());
+        List<String> urls = new ArrayList<String>();
+        urls.add("https://raw.githubusercontent.com/" + repo + "/" + commit + "/" + encodeUrlPath(relativePath));
+        urls.add("https://api.github.com/repos/" + repo + "/git/blobs/" + expectedBlobSha);
+
+        IOException lastFailure = null;
+        for (String url : urls) {
+            Path temporary = Files.createTempFile(destination.getParent(), ".mcose-resource-", ".tmp");
+            try {
+                downloadResourceUrl(url, temporary, url.contains("api.github.com/"));
+                String downloadedSha = computeGitBlobSha(temporary);
+                if (!equalsSafe(expectedBlobSha, downloadedSha)) {
+                    throw new IOException("Downloaded resource hash mismatch for " + relativePath
+                            + " (expected " + expectedBlobSha + ", received " + downloadedSha + ").");
+                }
+                try {
+                    Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException unsupported) {
+                    Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return;
+            } catch (IOException failure) {
+                lastFailure = failure;
+                result.attempts.add(url + " -> FAIL: " + failure.getMessage());
+                System.err.println("[mod-updater] Resource download source failed for " + relativePath
+                        + " (" + url + "): " + failure.getMessage());
+            } finally {
+                try { Files.deleteIfExists(temporary); } catch (IOException ignored) {}
+            }
+        }
+        throw new IOException("Failed to download changed resource '" + relativePath + "': "
+                + (lastFailure != null ? lastFailure.getMessage() : "no source succeeded"), lastFailure);
+    }
+
+    private static void downloadResourceUrl(String url, Path destination, boolean githubApi) throws IOException {
+        HttpURLConnection conn = openHttpConnection(url, RESOURCE_ARCHIVE_TIMEOUT_MS, RESOURCE_ARCHIVE_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+        conn.setRequestMethod("GET");
+        if (githubApi) {
+            conn.setRequestProperty("Accept", "application/vnd.github.raw+json");
+            String token = getenv("GITHUB_TOKEN");
+            if (token != null && !token.trim().isEmpty()) {
+                conn.setRequestProperty("Authorization", "token " + token.trim());
+            }
+        }
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            InputStream err = conn.getErrorStream();
+            String body = err != null ? readAll(err) : "";
+            throw new IOException("HTTP " + code + " " + truncateErrorBody(body));
+        }
+        InputStream in = new BufferedInputStream(conn.getInputStream());
+        OutputStream out = Files.newOutputStream(destination, StandardOpenOption.TRUNCATE_EXISTING);
+        byte[] buffer = new byte[64 * 1024];
+        try {
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+        } finally {
+            try { in.close(); } catch (IOException ignored) {}
+            try { out.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private static Path resourcePackManifestPath(Path minecraftDir) {
+        return minecraftDir.resolve("resources").resolve(RESOURCE_SYNC_MANIFEST_NAME);
+    }
+
+    private static ResourcePackManifest readResourcePackManifest(Path path) {
+        if (path == null || !Files.isRegularFile(path)) return null;
+        Properties properties = new Properties();
+        InputStream in = null;
+        try {
+            in = Files.newInputStream(path);
+            properties.load(new InputStreamReader(in, StandardCharsets.UTF_8));
+            if (!"1".equals(properties.getProperty("format"))) return null;
+            ResourcePackManifest manifest = new ResourcePackManifest();
+            manifest.repo = properties.getProperty("repo");
+            manifest.branch = properties.getProperty("branch");
+            manifest.commit = properties.getProperty("commit");
+            try {
+                manifest.checkedAt = Long.parseLong(properties.getProperty("checkedAt", "0"));
+            } catch (NumberFormatException ignored) {
+                manifest.checkedAt = 0L;
+            }
+            for (String key : properties.stringPropertyNames()) {
+                if (!key.startsWith("file.")) continue;
+                String encodedPath = key.substring("file.".length());
+                try {
+                    String relativePath = new String(Base64.getUrlDecoder().decode(encodedPath), StandardCharsets.UTF_8);
+                    String sha = properties.getProperty(key);
+                    if (isSafeResourcePackPath(relativePath) && sha != null && sha.matches("[0-9a-fA-F]{40}")) {
+                        manifest.files.put(relativePath.replace('\\', '/'), sha.toLowerCase(Locale.ROOT));
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Ignore malformed entries and rebuild the manifest from GitHub.
+                }
+            }
+            return manifest;
+        } catch (IOException failure) {
+            System.err.println("[mod-updater] Could not read resource sync manifest; a fresh comparison will be used: " + failure.getMessage());
+            return null;
+        } finally {
+            if (in != null) try { in.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private static void writeResourcePackManifest(Path path, ResourcePackManifest manifest) throws IOException {
+        ensureDir(path.getParent());
+        Properties properties = new Properties();
+        properties.setProperty("format", "1");
+        properties.setProperty("repo", manifest.repo != null ? manifest.repo : "");
+        properties.setProperty("branch", manifest.branch != null ? manifest.branch : "");
+        properties.setProperty("commit", manifest.commit != null ? manifest.commit : "");
+        properties.setProperty("checkedAt", Long.toString(manifest.checkedAt));
+        for (Map.Entry<String, String> entry : manifest.files.entrySet()) {
+            String encodedPath = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(entry.getKey().getBytes(StandardCharsets.UTF_8));
+            properties.setProperty("file." + encodedPath, entry.getValue());
+        }
+
+        Path temporary = Files.createTempFile(path.getParent(), ".mcose-resource-sync-", ".tmp");
+        OutputStream out = null;
+        try {
+            out = Files.newOutputStream(temporary, StandardOpenOption.TRUNCATE_EXISTING);
+            properties.store(new OutputStreamWriter(out, StandardCharsets.UTF_8),
+                    "Minecraft Oldschool Edition incremental resource sync state");
+            out.close();
+            out = null;
+            try {
+                Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            if (out != null) try { out.close(); } catch (IOException ignored) {}
+            try { Files.deleteIfExists(temporary); } catch (IOException ignored) {}
+        }
+    }
+
+    private static List<String> findMissingTrackedResourceFiles(ResourcePackManifest manifest, Path minecraftDir) {
+        List<String> missing = new ArrayList<String>();
+        for (String relativePath : manifest.files.keySet()) {
+            Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
+            if (destination != null && !Files.isRegularFile(destination)) {
+                missing.add(relativePath);
+            }
+        }
+        return missing;
+    }
+
+    private static Path resolveResourcePackDestination(Path minecraftDir, String relativePath) {
+        if (minecraftDir == null || !isSafeResourcePackPath(relativePath)) return null;
+        Path resourcesDir = minecraftDir.resolve("resources").normalize();
+        Path relative;
+        try {
+            relative = Paths.get(relativePath.replace('\\', '/')).normalize();
+        } catch (InvalidPathException invalid) {
+            return null;
+        }
+        if (relative.isAbsolute() || relative.startsWith("..")) return null;
+        Path destination = resourcesDir.resolve(relative).normalize();
+        return destination.startsWith(resourcesDir) ? destination : null;
+    }
+
+    private static boolean isSafeResourcePackPath(String relativePath) {
+        if (relativePath == null) return false;
+        String normalized = relativePath.replace('\\', '/');
+        if (!normalized.startsWith("assets/") || normalized.endsWith("/")) return false;
+        try {
+            Path path = Paths.get(normalized).normalize();
+            return !path.isAbsolute()
+                    && !path.startsWith("..")
+                    && path.getNameCount() >= 2
+                    && "assets".equals(path.getName(0).toString());
+        } catch (InvalidPathException invalid) {
+            return false;
+        }
+    }
+
+    private static String computeGitBlobSha(Path path) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-1");
+            long size = Files.size(path);
+            digest.update(("blob " + size + "\0").getBytes(StandardCharsets.UTF_8));
+            InputStream in = Files.newInputStream(path);
+            byte[] buffer = new byte[64 * 1024];
+            try {
+                int count;
+                while ((count = in.read(buffer)) != -1) {
+                    digest.update(buffer, 0, count);
+                }
+            } finally {
+                try { in.close(); } catch (IOException ignored) {}
+            }
+            byte[] hash = digest.digest();
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                hex.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+            }
+            return hex.toString();
+        } catch (GeneralSecurityException unavailable) {
+            throw new IOException("SHA-1 is unavailable for Git resource comparison.", unavailable);
+        }
+    }
+
+    private static void pruneEmptyResourceDirectories(Path start, Path assetsRoot) {
+        if (start == null || assetsRoot == null) return;
+        Path root = assetsRoot.normalize();
+        Path current = start.normalize();
+        while (current.startsWith(root) && !current.equals(root)) {
+            try {
+                Files.delete(current);
+            } catch (IOException notEmptyOrUnavailable) {
+                break;
+            }
+            current = current.getParent();
+            if (current == null) break;
+        }
+    }
+
+    private static String encodeUrlComponent(String value) throws IOException {
+        return URLEncoder.encode(value, "UTF-8").replace("+", "%20");
+    }
+
+    private static String encodeUrlPath(String path) throws IOException {
+        String[] segments = path.replace('\\', '/').split("/", -1);
+        StringBuilder encoded = new StringBuilder(path.length() + 16);
+        for (int i = 0; i < segments.length; i++) {
+            if (i > 0) encoded.append('/');
+            encoded.append(encodeUrlComponent(segments[i]));
+        }
+        return encoded.toString();
+    }
+
+    private static String shortSha(String sha) {
+        if (sha == null) return "unknown";
+        return sha.length() > 12 ? sha.substring(0, 12) : sha;
+    }
+
     private static void logResourceSyncResult(ResourceSyncResult result) {
         if (result == null) return;
         if (result.success) {
             System.out.println("[mod-updater] Resource pack sync complete (" + result.mode + "): copied="
                     + result.copiedFiles
-                    + ", langRefreshed=" + result.langFilesRefreshed
-                    + ", missingCopied=" + result.missingFilesCopied
-                    + ", skippedExisting=" + result.skippedExistingFiles
+                    + ", added=" + result.addedFilesDownloaded
+                    + ", changed=" + result.changedFilesDownloaded
+                    + ", removed=" + result.removedFiles
+                    + ", unchanged=" + result.unchangedFiles
+                    + ", checkDeferred=" + result.checkDeferred
                     + ", sourceBranch=" + (result.sourceBranch != null ? result.sourceBranch : "?")
+                    + ", sourceCommit=" + (result.sourceCommit != null ? shortSha(result.sourceCommit) : "?")
                     + ", sourceUrl=" + (result.sourceUrl != null ? result.sourceUrl : "?"));
             if (!result.missingAssetDetails.isEmpty()) {
                 for (int i = 0; i < result.missingAssetDetails.size(); i++) {
-                    System.out.println("[mod-updater] Missing asset detected and restored: " + result.missingAssetDetails.get(i));
+                    System.out.println("[mod-updater] Resource asset added or restored: " + result.missingAssetDetails.get(i));
                 }
             }
             if (result.suppressedMissingDetails > 0) {
-                System.out.println("[mod-updater] Missing asset restore logs truncated: +" + result.suppressedMissingDetails + " more files.");
+                System.out.println("[mod-updater] Added/restored resource logs truncated: +" + result.suppressedMissingDetails + " more files.");
+            }
+            if (!result.changedAssetDetails.isEmpty()) {
+                for (int i = 0; i < result.changedAssetDetails.size(); i++) {
+                    System.out.println("[mod-updater] Resource asset updated: " + result.changedAssetDetails.get(i));
+                }
+            }
+            if (result.suppressedChangedDetails > 0) {
+                System.out.println("[mod-updater] Updated resource logs truncated: +" + result.suppressedChangedDetails + " more files.");
+            }
+            if (!result.removedAssetDetails.isEmpty()) {
+                for (int i = 0; i < result.removedAssetDetails.size(); i++) {
+                    System.out.println("[mod-updater] Resource asset removed: " + result.removedAssetDetails.get(i));
+                }
+            }
+            if (result.suppressedRemovedDetails > 0) {
+                System.out.println("[mod-updater] Removed resource logs truncated: +" + result.suppressedRemovedDetails + " more files.");
             }
             if (!result.refreshedLanguageDetails.isEmpty()) {
                 for (int i = 0; i < result.refreshedLanguageDetails.size(); i++) {
@@ -2615,6 +3303,9 @@ public final class ModUpdaterGUI {
                         Files.copy(zis, dest);
                     }
                     result.copiedFiles++;
+                    if (mode == ResourceSyncMode.FULL) {
+                        System.out.println("[mod-updater] Full resource file installed: " + relNorm);
+                    }
                     if (isLangFile) {
                         result.langFilesRefreshed++;
                         result.addRefreshedLanguageDetail(relNorm);
