@@ -10,6 +10,7 @@ Cross‑platform updater for Prism Launcher / MultiMC instances or simple batch 
 - When a release contains a matching `server.jar`, the launcher installs it to `minecraftDir/lan-server/server.jar`.
 - The CLI supports the same companion server jar flow with `--serverAssetRegex`.
 - Launcher self-updates are launch-blocking: the launcher installs its own update and restarts before any game update or resource sync can continue.
+- Closing the GUI instead of pressing Play exits the pre-launch command with a non-zero status, causing Prism Launcher to cancel that instance session.
 
 ## Resource Sync Behavior
 
@@ -23,6 +24,7 @@ Cross‑platform updater for Prism Launcher / MultiMC instances or simple batch 
 - Stable resource sync uses `resourcePackBranch`; beta updates use `resourcePackBetaBranch`.
 - Full-sync mirror strategy: GitHub archive URL first, then codeload, then `master` fallback when the selected branch is `main`, then jsDelivr fallback.
 - If the launcher jar is locked and the self-update can only be staged, the current game launch is stopped so stale launcher code cannot fetch assets.
+- On Windows, the staged launcher update is preserved until `launcher-promoter.jar` replaces the unlocked GUI jar; a failed in-process promotion never deletes the pending update.
 
 ## Config Keys
 
@@ -33,6 +35,10 @@ Add these keys to `tools/mod-updater/updater.properties` when needed:
 - `resourcePackBetaBranch=beta`
 - `resourcePackCheckIntervalMinutes=60`
 - `serverJarRegex=server\.jar`
+- `launcherJarRegex=mod-updater-gui\.jar`
+- `launcherPromoterJarRegex=launcher-promoter\.jar`
+
+When the latest launcher release contains `launcher-promoter.jar`, the GUI tracks it as a separate component and installs it before updating or staging `mod-updater-gui.jar`. Releases without that asset continue to use the installed promoter.
 
 To use it in Prism Launcher use the following Custom Commands in your Minecraft instance:
 
@@ -43,4 +49,6 @@ To use it in Prism Launcher use the following Custom Commands in your Minecraft 
 **Post-exit:**
 
 "$INST_JAVA" -jar "$INST_DIR/tools/mod-updater/launcher-promoter.jar" --instanceDir "$INST_DIR"
+
+The Post-exit command is required for launcher self-updates on Windows. If a staged-update message repeats, confirm that `launcher-promoter.jar` exists beside `mod-updater-gui.jar` and that the command above is configured for the instance.
 

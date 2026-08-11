@@ -222,6 +222,9 @@ public final class ModUpdaterGUI {
     
     /** HTTP connection and read timeout in milliseconds (15 seconds) */
     private static final int HTTP_TIMEOUT_MS = 15000;
+
+    /** Non-zero status tells Prism that the pre-launch command was cancelled. */
+    private static final int PRE_LAUNCH_CANCELLED_EXIT_CODE = 2;
     
     /** Resource archive download timeout in milliseconds (45 seconds). */
     private static final int RESOURCE_ARCHIVE_TIMEOUT_MS = 45000;
@@ -382,6 +385,7 @@ public final class ModUpdaterGUI {
             // Launcher self-update configuration
             String launcherRepo = value(cli, cfg, "launcherRepo", "MinecraftOldschoolEdition/launcher-updates");
             String launcherJarRegex = value(cli, cfg, "launcherJarRegex", "mod-updater-gui\\.jar");
+            String launcherPromoterJarRegex = value(cli, cfg, "launcherPromoterJarRegex", "launcher-promoter\\.jar");
             
             // Resource pack repository (assets synced before each launch)
             String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
@@ -451,7 +455,12 @@ public final class ModUpdaterGUI {
             state.useBetaUpdates = useBetaUpdates;         // Beta updates enabled?
             state.configPath = configPath;                 // Path to config file
             state.instanceRoot = instanceRoot;             // Instance root directory
-            state.launcherUpdate = checkLauncherUpdate(launcherRepo, launcherJarRegex, launcherJarPath, instanceRoot);
+            state.launcherUpdate = checkLauncherUpdate(
+                    launcherRepo,
+                    launcherJarRegex,
+                    launcherPromoterJarRegex,
+                    launcherJarPath,
+                    instanceRoot);
             if (wasRestartedAfterLauncherUpdate() && state.launcherUpdate != null) {
                 state.launcherUpdate.updateAvailable = false;
             }
@@ -737,10 +746,14 @@ public final class ModUpdaterGUI {
 
     private static final class LauncherUpdateState {
         boolean updateAvailable;
+        boolean promoterUpdateAvailable;
         LatestRelease latest;
         ReleaseAsset asset;
+        ReleaseAsset promoterAsset;
         Path launcherJar;
+        Path promoterJar;
         String currentVersion;
+        String promoterCurrentVersion;
     }
     
     private enum ResourceSyncMode {
@@ -940,58 +953,99 @@ public final class ModUpdaterGUI {
         Path pending = pendingLauncherPath(jarPath);
         if (!Files.isRegularFile(pending)) return;
 
+        // The application class loader keeps this JAR open on Windows. Trying to
+        // replace it from here cannot succeed, and deleting the pending files in
+        // that failure path loses the already-downloaded update. Leave promotion
+        // to LauncherUpdatePromoter, which Prism runs after this JVM exits.
+        if (isWindows()) {
+            System.out.println("[mod-updater] Staged launcher update is waiting for the Prism post-exit promoter.");
+            return;
+        }
+
         String stagedVersion = readPendingVersionTag(jarPath);
 
         try {
             Files.move(pending, jarPath, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException ex) {
+            System.err.println("[mod-updater] Failed to apply staged launcher update; pending files were preserved: " + ex.getMessage());
+            return;
+        }
+
+        try {
             if (stagedVersion != null) {
                 writeLauncherVersionMarker(jarPath, stagedVersion);
                 writeLauncherVersionJson(instanceRoot, stagedVersion);
             }
         } catch (IOException ex) {
-            System.err.println("[mod-updater] Failed to apply staged launcher update: " + ex.getMessage());
-        } finally {
-            try { Files.deleteIfExists(pending); } catch (IOException ignored) {}
-            Path pendingVersion = pendingVersionMarkerPath(jarPath);
-            if (pendingVersion != null) {
-                try { Files.deleteIfExists(pendingVersion); } catch (IOException ignored) {}
-            }
+            System.err.println("[mod-updater] Launcher jar was updated, but its version marker could not be written: " + ex.getMessage());
+        }
+
+        try { Files.deleteIfExists(pending); } catch (IOException ignored) {}
+        Path pendingVersion = pendingVersionMarkerPath(jarPath);
+        if (pendingVersion != null) {
+            try { Files.deleteIfExists(pendingVersion); } catch (IOException ignored) {}
         }
     }
 
-    private static LauncherUpdateState checkLauncherUpdate(String repo, String assetRegex, Path launcherJar, Path instanceRoot) {
+    private static LauncherUpdateState checkLauncherUpdate(
+            String repo,
+            String assetRegex,
+            String promoterAssetRegex,
+            Path launcherJar,
+            Path instanceRoot) {
         LauncherUpdateState state = new LauncherUpdateState();
         state.launcherJar = launcherJar;
+        state.promoterJar = launcherPromoterPath(launcherJar);
         if (repo == null || repo.isEmpty() || launcherJar == null) return state;
         try {
             LatestRelease latest = fetchLatestRelease(repo);
-            ReleaseAsset asset = selectAsset(latest.assets, assetRegex != null ? assetRegex : ".*\\.jar");
-            if (asset == null) {
-                System.err.println("[mod-updater] No launcher asset matched regex '" + assetRegex + "'.");
-                return state;
-            }
-            String currentVersion = detectLauncherVersion(launcherJar, instanceRoot);
-            if (currentVersion == null && latest.tag != null && Files.isRegularFile(launcherJar)) {
-                try {
-                    long localSize = Files.size(launcherJar);
-                    Long remoteSize = fetchRemoteContentLength(asset.url);
-                    if (remoteSize != null && remoteSize.longValue() == localSize) {
-                        currentVersion = latest.tag;
-                        writeLauncherVersionMarker(launcherJar, currentVersion);
-                        writeLauncherVersionJson(instanceRoot, currentVersion);
-                    }
-                } catch (IOException ignored) {}
-            }
-            boolean needsUpdate = currentVersion == null || latest.tag == null || !latest.tag.equals(currentVersion);
+            ReleaseAsset asset = selectOptionalAsset(latest.assets, assetRegex != null ? assetRegex : ".*\\.jar");
+            ReleaseAsset promoterAsset = selectOptionalAsset(latest.assets, promoterAssetRegex);
+
             state.latest = latest;
             state.asset = asset;
-            state.currentVersion = currentVersion;
-            state.updateAvailable = needsUpdate;
-            if (!needsUpdate && latest.tag != null) {
-                try {
-                    writeLauncherVersionMarker(launcherJar, latest.tag);
-                    writeLauncherVersionJson(instanceRoot, latest.tag);
-                } catch (IOException ignored) {}
+            state.promoterAsset = promoterAsset;
+
+            if (asset == null) {
+                System.err.println("[mod-updater] No launcher asset matched regex '" + assetRegex + "'.");
+            } else {
+                String currentVersion = detectLauncherVersion(launcherJar, instanceRoot);
+                if (currentVersion == null && latest.tag != null && Files.isRegularFile(launcherJar)) {
+                    try {
+                        long localSize = Files.size(launcherJar);
+                        Long remoteSize = fetchRemoteContentLength(asset.url);
+                        if (remoteSize != null && remoteSize.longValue() == localSize) {
+                            currentVersion = latest.tag;
+                            writeLauncherVersionMarker(launcherJar, currentVersion);
+                            writeLauncherVersionJson(instanceRoot, currentVersion);
+                        }
+                    } catch (IOException ignored) {}
+                }
+                boolean needsUpdate = currentVersion == null || latest.tag == null || !latest.tag.equals(currentVersion);
+                state.currentVersion = currentVersion;
+                state.updateAvailable = needsUpdate;
+                if (!needsUpdate && latest.tag != null) {
+                    try {
+                        writeLauncherVersionMarker(launcherJar, latest.tag);
+                        writeLauncherVersionJson(instanceRoot, latest.tag);
+                    } catch (IOException ignored) {}
+                }
+            }
+
+            if (promoterAsset != null && state.promoterJar != null) {
+                String promoterVersion = detectLauncherPromoterVersion(state.promoterJar, instanceRoot);
+                boolean promoterNeedsUpdate = !Files.isRegularFile(state.promoterJar)
+                        || promoterVersion == null
+                        || latest.tag == null
+                        || !latest.tag.equals(promoterVersion);
+                state.promoterCurrentVersion = promoterVersion;
+                state.promoterUpdateAvailable = promoterNeedsUpdate;
+                if (!promoterNeedsUpdate && latest.tag != null) {
+                    try {
+                        writeLauncherVersionMarker(state.promoterJar, latest.tag);
+                        writeLauncherPromoterVersionJson(instanceRoot, latest.tag);
+                    } catch (IOException ignored) {}
+                }
             }
         } catch (Throwable t) {
             System.err.println("[mod-updater] Launcher self-update check failed: " + t.getMessage());
@@ -1030,12 +1084,28 @@ public final class ModUpdaterGUI {
         return instanceRoot.resolve("tools").resolve("mod-updater").resolve("version.json");
     }
 
+    private static Path launcherPromoterPath(Path launcherJar) {
+        if (launcherJar == null || launcherJar.getParent() == null) return null;
+        return launcherJar.resolveSibling("launcher-promoter.jar");
+    }
+
+    private static String detectLauncherPromoterVersion(Path promoterJar, Path instanceRoot) {
+        String jsonVersion = readVersionJsonValue(instanceRoot, "promoter");
+        if (jsonVersion != null && !jsonVersion.isEmpty()) return jsonVersion.trim();
+        String marker = readLauncherVersionMarker(promoterJar);
+        return marker != null && !marker.isEmpty() ? marker.trim() : null;
+    }
+
     private static String readLauncherVersionJson(Path instanceRoot) {
+        return readVersionJsonValue(instanceRoot, "launcher");
+    }
+
+    private static String readVersionJsonValue(Path instanceRoot, String key) {
         Path jsonPath = launcherVersionJsonPath(instanceRoot);
-        if (jsonPath == null || !Files.isRegularFile(jsonPath)) return null;
+        if (jsonPath == null || key == null || !Files.isRegularFile(jsonPath)) return null;
         try {
             String json = new String(Files.readAllBytes(jsonPath), StandardCharsets.UTF_8);
-            Matcher m = Pattern.compile("\"launcher\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
+            Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
             if (m.find()) {
                 return m.group(1);
             }
@@ -1044,17 +1114,34 @@ public final class ModUpdaterGUI {
     }
 
     private static void writeLauncherVersionJson(Path instanceRoot, String version) throws IOException {
-        if (instanceRoot == null || version == null) return;
+        writeVersionJsonValue(instanceRoot, "launcher", version);
+    }
+
+    private static void writeLauncherPromoterVersionJson(Path instanceRoot, String version) throws IOException {
+        writeVersionJsonValue(instanceRoot, "promoter", version);
+    }
+
+    private static void writeVersionJsonValue(Path instanceRoot, String key, String version) throws IOException {
+        if (instanceRoot == null || key == null || version == null) return;
         Path jsonPath = launcherVersionJsonPath(instanceRoot);
         if (jsonPath == null) return;
         Path parent = jsonPath.getParent();
         if (parent != null && !Files.isDirectory(parent)) {
             Files.createDirectories(parent);
         }
+        String launcherVersion = "launcher".equals(key) ? version : readVersionJsonValue(instanceRoot, "launcher");
+        String promoterVersion = "promoter".equals(key) ? version : readVersionJsonValue(instanceRoot, "promoter");
         String newline = System.getProperty("line.separator", "\n");
         StringBuilder sb = new StringBuilder();
         sb.append("{").append(newline);
-        sb.append("  \"launcher\": \"").append(version).append("\"").append(newline);
+        if (launcherVersion != null) {
+            sb.append("  \"launcher\": \"").append(launcherVersion).append("\"");
+            if (promoterVersion != null) sb.append(",");
+            sb.append(newline);
+        }
+        if (promoterVersion != null) {
+            sb.append("  \"promoter\": \"").append(promoterVersion).append("\"").append(newline);
+        }
         sb.append("}").append(newline);
         Files.write(jsonPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
@@ -1303,7 +1390,10 @@ public final class ModUpdaterGUI {
         SwingUtilities.invokeLater(new Runnable() {
             public void run() {
                 final JFrame frame = new JFrame("Minecraft Oldschool Edition Launcher");
-                frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+                // Prism continues the instance launch when a pre-launch command
+                // exits successfully. Handle the close button ourselves so closing
+                // this launcher means "cancel this instance launch", not "Play".
+                frame.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
                 frame.setMinimumSize(new Dimension(854, 480));
                 // Start slightly larger than the classic 854x480 to better match the original launcher feel.
                 frame.setSize(900, 520);
@@ -1478,8 +1568,7 @@ public final class ModUpdaterGUI {
 
                 boolean hasLauncherUpdate = launcherState != null
                         && launcherState.launcherUpdate != null
-                        && launcherState.launcherUpdate.updateAvailable
-                        && launcherState.launcherUpdate.asset != null;
+                        && hasLauncherSelfUpdate(launcherState.launcherUpdate);
                 updateLauncherButton.setVisible(hasLauncherUpdate);
 
                 // Load the nested patch notes "web page"
@@ -1705,8 +1794,16 @@ public final class ModUpdaterGUI {
                     }
                 });
 
-                // Release the main-thread latch when the window is closed so the JVM can exit.
+                // A user-initiated close cancels Prism's pre-launch pipeline. A
+                // programmatic dispose (used by launcher self-update) only releases
+                // the latch and lets that update thread control the eventual status.
                 frame.addWindowListener(new java.awt.event.WindowAdapter() {
+                    @Override
+                    public void windowClosing(java.awt.event.WindowEvent e) {
+                        System.out.println("[mod-updater] Launcher closed without Play; cancelling Prism pre-launch.");
+                        System.exit(PRE_LAUNCH_CANCELLED_EXIT_CODE);
+                    }
+
                     @Override
                     public void windowClosed(java.awt.event.WindowEvent e) {
                         windowClosedLatch.countDown();
@@ -1765,10 +1862,15 @@ public final class ModUpdaterGUI {
     }
 
     private static boolean hasBlockingLauncherSelfUpdate(LauncherState launcherState) {
-        if (wasRestartedAfterLauncherUpdate()) return false;
         if (launcherState == null || launcherState.launcherUpdate == null) return false;
-        LauncherUpdateState update = launcherState.launcherUpdate;
-        return update.updateAvailable && update.asset != null;
+        return hasLauncherSelfUpdate(launcherState.launcherUpdate);
+    }
+
+    private static boolean hasLauncherSelfUpdate(LauncherUpdateState update) {
+        if (update == null) return false;
+        boolean launcherUpdate = update.updateAvailable && update.asset != null;
+        boolean promoterUpdate = update.promoterUpdateAvailable && update.promoterAsset != null;
+        return launcherUpdate || promoterUpdate;
     }
 
     private static void updateLauncherAndRestart(JFrame frame, LauncherState launcherState, ProgressUI ui) throws Exception {
@@ -1776,25 +1878,57 @@ public final class ModUpdaterGUI {
             throw new IOException("Launcher update state is unavailable.");
         }
         LauncherUpdateState update = launcherState.launcherUpdate;
-        if (!update.updateAvailable || update.asset == null) {
-            return;
-        }
-        if (update.launcherJar == null) {
+        boolean updateLauncher = update.updateAvailable && update.asset != null;
+        boolean updatePromoter = update.promoterUpdateAvailable && update.promoterAsset != null;
+        if (!updateLauncher && !updatePromoter) return;
+        if (updateLauncher && update.launcherJar == null) {
             throw new IOException("Cannot update the launcher because its jar path could not be determined.");
         }
 
-        ui.setPhaseText("Downloading launcher update...");
-        Path download = downloadToTemp(ui, update.asset.url, update.asset.name, 0.0, 0.75);
+        String latestTag = update.latest != null ? update.latest.tag : null;
 
-        ui.setPhaseText("Installing launcher update...");
-        ui.progress(82);
-        boolean appliedNow = installLauncherUpdate(update.launcherJar, download, update.latest != null ? update.latest.tag : null, launcherState.instanceRoot);
-        if (!appliedNow) {
-            throw new IOException("Launcher update was staged, but the current launcher jar is locked. The game launch was stopped so old asset-fetching code cannot run. Restart Prism/PrismMC to finish installing the launcher update.");
+        if (updatePromoter) {
+            if (update.promoterJar == null) {
+                throw new IOException("Cannot update the launcher promoter because its jar path could not be determined.");
+            }
+            ui.setPhaseText("Downloading launcher promoter update...");
+            double promoterEnd = updateLauncher ? 0.25 : 0.75;
+            Path promoterDownload = downloadToTemp(
+                    ui,
+                    update.promoterAsset.url,
+                    update.promoterAsset.name,
+                    0.0,
+                    promoterEnd);
+            ui.setPhaseText("Installing launcher promoter update...");
+            ui.progress(updateLauncher ? 28 : 82);
+            installLauncherPromoterUpdate(update.promoterJar, promoterDownload, latestTag, launcherState.instanceRoot);
+            update.promoterUpdateAvailable = false;
+            update.promoterCurrentVersion = latestTag != null ? latestTag : update.promoterCurrentVersion;
         }
 
-        launcherState.launcherUpdate.updateAvailable = false;
-        launcherState.launcherUpdate.currentVersion = update.latest != null ? update.latest.tag : update.currentVersion;
+        if (updateLauncher) {
+            ui.setPhaseText("Downloading launcher update...");
+            Path download = downloadToTemp(
+                    ui,
+                    update.asset.url,
+                    update.asset.name,
+                    updatePromoter ? 0.30 : 0.0,
+                    0.75);
+
+            ui.setPhaseText("Installing launcher update...");
+            ui.progress(82);
+            boolean appliedNow = installLauncherUpdate(update.launcherJar, download, latestTag, launcherState.instanceRoot);
+            if (!appliedNow) {
+                String promoterStatus = updatePromoter ? " The launcher promoter was updated first." : "";
+                throw new IOException("Launcher update was staged because the running launcher jar could not be replaced."
+                        + promoterStatus
+                        + " The game launch was stopped so old asset-fetching code cannot run. Prism/PrismMC must run launcher-promoter.jar as its Post-exit command; then launch the instance again. If this repeats, verify the Post-exit command and folder write permissions.");
+            }
+
+            update.updateAvailable = false;
+            update.currentVersion = latestTag != null ? latestTag : update.currentVersion;
+        }
+
         ui.setPhaseText("Restarting launcher...");
         ui.progress(100);
         try { Thread.sleep(250L); } catch (InterruptedException ignored) {}
@@ -1858,8 +1992,8 @@ public final class ModUpdaterGUI {
 
         if (launcherState == null || launcherState.launcherUpdate == null) return;
         final LauncherUpdateState update = launcherState.launcherUpdate;
-        if (!update.updateAvailable || update.asset == null) return;
-        if (update.launcherJar == null) {
+        if (!hasLauncherSelfUpdate(update)) return;
+        if (update.updateAvailable && update.asset != null && update.launcherJar == null) {
             JOptionPane.showMessageDialog(frame,
                     "Cannot update the launcher because its jar path could not be determined.",
                     "Launcher update", JOptionPane.WARNING_MESSAGE);
@@ -3033,6 +3167,21 @@ public final class ModUpdaterGUI {
                     && "assets".equals(path.getName(0).toString());
         } catch (InvalidPathException invalid) {
             return false;
+        }
+    }
+
+    private static void installLauncherPromoterUpdate(
+            Path promoterJar,
+            Path payload,
+            String versionTag,
+            Path instanceRoot) throws IOException {
+        if (promoterJar == null) throw new IOException("Launcher promoter jar path is unknown.");
+        Path parent = promoterJar.getParent();
+        if (parent != null) ensureDir(parent);
+        Files.move(payload, promoterJar, StandardCopyOption.REPLACE_EXISTING);
+        if (versionTag != null) {
+            writeLauncherVersionMarker(promoterJar, versionTag);
+            writeLauncherPromoterVersionJson(instanceRoot, versionTag);
         }
     }
 

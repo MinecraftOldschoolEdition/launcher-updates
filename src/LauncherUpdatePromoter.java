@@ -7,6 +7,8 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Post-exit helper that promotes staged launcher updates after the main GUI has closed.
@@ -43,6 +45,9 @@ import java.util.Map;
  */
 public final class LauncherUpdatePromoter {
 
+    private static final long WINDOWS_REPLACE_TIMEOUT_MS = 30000L;
+    private static final long WINDOWS_REPLACE_RETRY_MS = 250L;
+
     // =========================================================================
     // MAIN ENTRY POINT
     // =========================================================================
@@ -78,6 +83,7 @@ public final class LauncherUpdatePromoter {
             promote(launcherJar, instanceDir);
         } catch (IOException e) {
             System.err.println("[launcher-promoter] Failed to promote staged update: " + e.getMessage());
+            System.exit(1);
         }
     }
 
@@ -163,7 +169,7 @@ public final class LauncherUpdatePromoter {
 
         // Replace the current JAR with the pending update
         // This is the critical operation that was previously impossible while the GUI was running
-        Files.move(pendingJar, launcherJar, StandardCopyOption.REPLACE_EXISTING);
+        replaceLauncherJar(pendingJar, launcherJar);
         
         // Update version tracking files if we have a version tag
         if (versionTag != null && !versionTag.isEmpty()) {
@@ -180,6 +186,45 @@ public final class LauncherUpdatePromoter {
         }
         
         System.out.println("[launcher-promoter] Promoted staged launcher update to " + launcherJar);
+    }
+
+    /**
+     * Replaces the launcher JAR, allowing a short grace period on Windows for
+     * the GUI JVM (or a virus scanner) to release its file handle.
+     */
+    private static void replaceLauncherJar(Path pendingJar, Path launcherJar) throws IOException {
+        if (!isWindows()) {
+            Files.move(pendingJar, launcherJar, StandardCopyOption.REPLACE_EXISTING);
+            return;
+        }
+
+        long deadline = System.currentTimeMillis() + WINDOWS_REPLACE_TIMEOUT_MS;
+        IOException lastFailure = null;
+        while (true) {
+            try {
+                Files.move(pendingJar, launcherJar, StandardCopyOption.REPLACE_EXISTING);
+                return;
+            } catch (IOException ex) {
+                lastFailure = ex;
+            }
+
+            if (System.currentTimeMillis() >= deadline) {
+                throw new IOException(
+                        "Timed out waiting for the launcher jar to unlock: " + launcherJar,
+                        lastFailure);
+            }
+
+            try {
+                Thread.sleep(WINDOWS_REPLACE_RETRY_MS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for the launcher jar to unlock: " + launcherJar, lastFailure);
+            }
+        }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
     // =========================================================================
@@ -288,16 +333,36 @@ public final class LauncherUpdatePromoter {
         // Construct path: instance/tools/mod-updater/version.json
         Path jsonPath = instanceRoot.resolve("tools").resolve("mod-updater").resolve("version.json");
         ensureDir(jsonPath.getParent());
+
+        // The GUI updater versions this helper independently. Preserve that
+        // component marker when promoting the staged GUI launcher.
+        String promoterVersion = readVersionJsonValue(jsonPath, "promoter");
         
         // Build simple JSON manually (no external dependencies)
         String newline = System.getProperty("line.separator", "\n");
         StringBuilder sb = new StringBuilder();
         sb.append("{").append(newline);
-        sb.append("  \"launcher\": \"").append(version).append("\"").append(newline);
+        sb.append("  \"launcher\": \"").append(version).append("\"");
+        if (promoterVersion != null) sb.append(",");
+        sb.append(newline);
+        if (promoterVersion != null) {
+            sb.append("  \"promoter\": \"").append(promoterVersion).append("\"").append(newline);
+        }
         sb.append("}").append(newline);
         
         Files.write(jsonPath, sb.toString().getBytes(StandardCharsets.UTF_8),
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    private static String readVersionJsonValue(Path jsonPath, String key) {
+        if (jsonPath == null || key == null || !Files.isRegularFile(jsonPath)) return null;
+        try {
+            String json = new String(Files.readAllBytes(jsonPath), StandardCharsets.UTF_8);
+            Matcher matcher = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
+            return matcher.find() ? matcher.group(1) : null;
+        } catch (IOException ignored) {
+            return null;
+        }
     }
 
     // =========================================================================
