@@ -2824,7 +2824,7 @@ public final class ModUpdaterGUI {
                     System.out.println("[mod-updater] Removed resource file deleted upstream: " + previousPath);
                     result.removedFiles++;
                     result.addRemovedAssetDetail(previousPath);
-                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources").resolve("assets"));
+                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources"));
                 }
             }
         }
@@ -2874,7 +2874,7 @@ public final class ModUpdaterGUI {
                 if (destination != null && Files.deleteIfExists(destination)) {
                     result.removedFiles++;
                     result.addRemovedAssetDetail(previousPath);
-                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources").resolve("assets"));
+                    pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources"));
                 }
             }
         }
@@ -2959,7 +2959,7 @@ public final class ModUpdaterGUI {
         }
         result.sourceUrl = url;
         System.out.println("[mod-updater] Resource repository tree at " + shortSha(commit)
-                + " contains " + remote.files.size() + " asset file(s).");
+                + " contains " + remote.files.size() + " resource file(s).");
         return remote;
     }
 
@@ -3158,16 +3158,26 @@ public final class ModUpdaterGUI {
     private static boolean isSafeResourcePackPath(String relativePath) {
         if (relativePath == null) return false;
         String normalized = relativePath.replace('\\', '/');
-        if (!normalized.startsWith("assets/") || normalized.endsWith("/")) return false;
+        if (!isResourceFolderPath(normalized) || normalized.endsWith("/")) return false;
         try {
             Path path = Paths.get(normalized).normalize();
             return !path.isAbsolute()
                     && !path.startsWith("..")
                     && path.getNameCount() >= 2
-                    && "assets".equals(path.getName(0).toString());
+                    && isResourceTopLevelFolder(path.getName(0).toString());
         } catch (InvalidPathException invalid) {
             return false;
         }
+    }
+
+    private static boolean isResourceFolderPath(String normalizedRelativePath) {
+        return normalizedRelativePath != null
+                && (normalizedRelativePath.startsWith("assets/")
+                || normalizedRelativePath.startsWith("data/"));
+    }
+
+    private static boolean isResourceTopLevelFolder(String firstSegment) {
+        return "assets".equals(firstSegment) || "data".equals(firstSegment);
     }
 
     private static void installLauncherPromoterUpdate(
@@ -3391,7 +3401,7 @@ public final class ModUpdaterGUI {
                 }
                 
                 String relativePath = name.substring(slashIdx + 1);
-                if (!relativePath.startsWith("assets/")) {
+                if (!isResourceFolderPath(relativePath)) {
                     zis.closeEntry();
                     continue;
                 }
