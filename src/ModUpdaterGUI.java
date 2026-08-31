@@ -47,7 +47,14 @@ import java.util.List;
 import java.util.*;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -138,6 +145,8 @@ import java.util.zip.ZipFile;
  * --resourcePackBranch <branch> Stable resource sync branch (default: main)
  * --resourcePackBetaBranch <branch> Beta resource sync branch (default: beta)
  * --resourcePackCheckIntervalMinutes <minutes> Delay between unchanged-commit local scans (default: 60)
+ * --lwjgl3Repo <owner/repo> Repository containing the Prism org.lwjgl.json release asset
+ * --lwjgl3AssetRegex <regex> Full-match regex for the LWJGL component release asset
  * 
  * =============================================================================
  * CONFIGURATION FILE (updater.properties)
@@ -154,6 +163,8 @@ import java.util.zip.ZipFile;
  *   resourcePackBranch=main
  *   resourcePackBetaBranch=beta
  *   resourcePackCheckIntervalMinutes=60
+ *   lwjgl3Repo=MinecraftOldschoolEdition/lwjgl3-patch-fetcher
+ *   lwjgl3AssetRegex=^org[.]lwjgl[.]json$
  * 
  * @author Minecraft Oldschool Edition Team
  * @see ModUpdater CLI version of this updater
@@ -237,6 +248,15 @@ public final class ModUpdaterGUI {
     
     /** Maximum per-run detailed resource file log lines for each category. */
     private static final int RESOURCE_SYNC_DETAIL_LOG_LIMIT = 120;
+
+    /** Maximum number of resource-pack files fetched at the same time. */
+    private static final int RESOURCE_DOWNLOAD_THREADS = 4;
+
+    /** Number of attempts for a transient metadata or per-file endpoint failure. */
+    private static final int RESOURCE_ENDPOINT_RETRIES = 2;
+
+    /** Base delay for transient metadata and per-file retry backoff. */
+    private static final long RESOURCE_ENDPOINT_RETRY_BASE_DELAY_MS = 500L;
 
     /** Default delay between local integrity scans when the remote commit is unchanged. */
     private static final long DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES = 60L;
@@ -391,8 +411,16 @@ public final class ModUpdaterGUI {
             String resourcePackRepo = value(cli, cfg, "resourcePackRepo", "MinecraftOldschoolEdition/resourcepack");
             String resourcePackBranch = value(cli, cfg, "resourcePackBranch", "main");
             String resourcePackBetaBranch = value(cli, cfg, "resourcePackBetaBranch", "beta");
+            String resourcePackArchiveMirrorUrl = normalizeOptionalText(
+                    value(cli, cfg, "resourcePackArchiveMirrorUrl", null));
             long resourcePackCheckIntervalMs = parseResourcePackCheckIntervalMillis(
                     value(cli, cfg, "resourcePackCheckIntervalMinutes", Long.toString(DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES)));
+
+            // Separately-versioned Prism component patch used to replace the legacy
+            // org.lwjgl metadata with the LWJGL 3 runtime required by this client.
+            String lwjgl3Repo = value(cli, cfg, "lwjgl3Repo", "MinecraftOldschoolEdition/lwjgl3-patch-fetcher");
+            String lwjgl3AssetRegex = normalizeOptionalRegex(
+                    value(cli, cfg, "lwjgl3AssetRegex", "^org[.]lwjgl[.]json$"));
 
             // =================================================================
             // STEP 4: Resolve Directory Paths
@@ -449,7 +477,12 @@ public final class ModUpdaterGUI {
             // =================================================================
             // Package all state into a single object for the GUI
             LauncherState state = new LauncherState();
-            state.hasUpdate = !branch.upToDate;           // Is a game update available?
+            state.lwjgl3PatchUpdate = checkLwjgl3PatchUpdate(
+                    lwjgl3Repo,
+                    lwjgl3AssetRegex,
+                    instanceRoot);
+            state.hasUpdate = !branch.upToDate
+                    || (state.lwjgl3PatchUpdate != null && state.lwjgl3PatchUpdate.updateAvailable);
             state.releaseRepo = repo;                      // Main release repository
             state.betaRepo = betaRepo;                     // Beta release repository
             state.useBetaUpdates = useBetaUpdates;         // Beta updates enabled?
@@ -468,6 +501,7 @@ public final class ModUpdaterGUI {
             state.resourcePackRepo = resourcePackRepo;     // Resource pack repository
             state.resourcePackBranch = resourcePackBranch; // Stable resource pack branch
             state.resourcePackBetaBranch = resourcePackBetaBranch; // Beta resource pack branch
+            state.resourcePackArchiveMirrorUrl = resourcePackArchiveMirrorUrl; // Optional independent full-pack mirror
             state.resourcePackCheckIntervalMs = resourcePackCheckIntervalMs; // Delay between unchanged-commit local scans
             state.minecraftDir = minecraftDir;             // Minecraft directory for assets
             state.launchArgs = args != null ? (String[]) args.clone() : new String[0];
@@ -494,7 +528,8 @@ public final class ModUpdaterGUI {
                 || "--minecraftDir".equals(a) || "--instanceDir".equals(a) || "--mode".equals(a)
                 || "--jarmodName".equals(a) || "--newsUrl".equals(a)
                 || "--resourcePackRepo".equals(a) || "--resourcePackBranch".equals(a) || "--resourcePackBetaBranch".equals(a)
-                || "--resourcePackCheckIntervalMinutes".equals(a)) {
+                || "--resourcePackCheckIntervalMinutes".equals(a)
+                || "--lwjgl3Repo".equals(a) || "--lwjgl3AssetRegex".equals(a)) {
                 if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + a);
                 map.put(a, args[++i]);
             } else {
@@ -545,7 +580,10 @@ public final class ModUpdaterGUI {
         sb.append("resourcePackRepo=MinecraftOldschoolEdition/resourcepack").append(newline);
         sb.append("resourcePackBranch=main").append(newline);
         sb.append("resourcePackBetaBranch=beta").append(newline);
+        sb.append("resourcePackArchiveMirrorUrl=").append(newline);
         sb.append("resourcePackCheckIntervalMinutes=").append(DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES).append(newline);
+        sb.append("lwjgl3Repo=MinecraftOldschoolEdition/lwjgl3-patch-fetcher").append(newline);
+        sb.append("lwjgl3AssetRegex=^org[.]lwjgl[.]json$").append(newline);
         Files.write(configPath, sb.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -559,6 +597,12 @@ public final class ModUpdaterGUI {
     private static String normalizeOptionalRegex(String regex) {
         if (regex == null) return null;
         String trimmed = regex.trim();
+        return trimmed.length() == 0 ? null : trimmed;
+    }
+
+    private static String normalizeOptionalText(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
         return trimmed.length() == 0 ? null : trimmed;
     }
 
@@ -729,9 +773,11 @@ public final class ModUpdaterGUI {
         String resourcePackRepo;
         String resourcePackBranch;
         String resourcePackBetaBranch;
+        String resourcePackArchiveMirrorUrl;
         long resourcePackCheckIntervalMs;
         Path minecraftDir;
         String[] launchArgs;
+        Lwjgl3PatchUpdateState lwjgl3PatchUpdate;
     }
 
     private static final class BranchContext {
@@ -754,6 +800,165 @@ public final class ModUpdaterGUI {
         Path promoterJar;
         String currentVersion;
         String promoterCurrentVersion;
+    }
+
+    private static final class Lwjgl3PatchUpdateState {
+        boolean updateAvailable;
+        LatestRelease latest;
+        ReleaseAsset asset;
+        Path patchFile;
+        String currentVersion;
+    }
+
+    private static final class PreparedLwjgl3Patch {
+        final Lwjgl3PatchUpdateState update;
+        final Path target;
+        final Path staged;
+        final String version;
+
+        PreparedLwjgl3Patch(Lwjgl3PatchUpdateState update, Path target, Path staged, String version) {
+            this.update = update;
+            this.target = target;
+            this.staged = staged;
+            this.version = version;
+        }
+    }
+
+    /** Minimal dependency-free JSON syntax validator for trusted component payloads. */
+    private static final class JsonSyntaxValidator {
+        private final String text;
+        private int index;
+
+        private JsonSyntaxValidator(String text) {
+            this.text = text;
+        }
+
+        static void validate(String text) throws IOException {
+            if (text == null) throw new IOException("JSON payload is null.");
+            JsonSyntaxValidator parser = new JsonSyntaxValidator(text);
+            parser.skipWhitespace();
+            parser.readValue();
+            parser.skipWhitespace();
+            if (parser.index != text.length()) parser.fail("trailing data");
+        }
+
+        private void readValue() throws IOException {
+            if (index >= text.length()) fail("expected a value");
+            char c = text.charAt(index);
+            if (c == '{') readObject();
+            else if (c == '[') readArray();
+            else if (c == '"') readString();
+            else if (c == 't') readLiteral("true");
+            else if (c == 'f') readLiteral("false");
+            else if (c == 'n') readLiteral("null");
+            else if (c == '-' || (c >= '0' && c <= '9')) readNumber();
+            else fail("unexpected character '" + c + "'");
+        }
+
+        private void readObject() throws IOException {
+            index++;
+            skipWhitespace();
+            if (consume('}')) return;
+            while (true) {
+                if (index >= text.length() || text.charAt(index) != '"') fail("expected an object key");
+                readString();
+                skipWhitespace();
+                require(':');
+                skipWhitespace();
+                readValue();
+                skipWhitespace();
+                if (consume('}')) return;
+                require(',');
+                skipWhitespace();
+            }
+        }
+
+        private void readArray() throws IOException {
+            index++;
+            skipWhitespace();
+            if (consume(']')) return;
+            while (true) {
+                readValue();
+                skipWhitespace();
+                if (consume(']')) return;
+                require(',');
+                skipWhitespace();
+            }
+        }
+
+        private void readString() throws IOException {
+            require('"');
+            while (index < text.length()) {
+                char c = text.charAt(index++);
+                if (c == '"') return;
+                if (c < 0x20) fail("unescaped control character in string");
+                if (c != '\\') continue;
+                if (index >= text.length()) fail("unterminated escape sequence");
+                char escaped = text.charAt(index++);
+                if (escaped == '"' || escaped == '\\' || escaped == '/'
+                        || escaped == 'b' || escaped == 'f' || escaped == 'n'
+                        || escaped == 'r' || escaped == 't') {
+                    continue;
+                }
+                if (escaped != 'u') fail("invalid escape sequence");
+                for (int i = 0; i < 4; i++) {
+                    if (index >= text.length() || Character.digit(text.charAt(index++), 16) < 0) {
+                        fail("invalid unicode escape");
+                    }
+                }
+            }
+            fail("unterminated string");
+        }
+
+        private void readNumber() throws IOException {
+            if (consume('-') && index >= text.length()) fail("incomplete number");
+            if (consume('0')) {
+                if (index < text.length() && Character.isDigit(text.charAt(index))) fail("leading zero in number");
+            } else {
+                readDigits();
+            }
+            if (consume('.')) readDigits();
+            if (index < text.length() && (text.charAt(index) == 'e' || text.charAt(index) == 'E')) {
+                index++;
+                if (index < text.length() && (text.charAt(index) == '+' || text.charAt(index) == '-')) index++;
+                readDigits();
+            }
+        }
+
+        private void readDigits() throws IOException {
+            int start = index;
+            while (index < text.length() && Character.isDigit(text.charAt(index))) index++;
+            if (index == start) fail("expected a digit");
+        }
+
+        private void readLiteral(String literal) throws IOException {
+            if (!text.regionMatches(index, literal, 0, literal.length())) fail("invalid literal");
+            index += literal.length();
+        }
+
+        private void skipWhitespace() {
+            while (index < text.length()) {
+                char c = text.charAt(index);
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return;
+                index++;
+            }
+        }
+
+        private boolean consume(char expected) {
+            if (index < text.length() && text.charAt(index) == expected) {
+                index++;
+                return true;
+            }
+            return false;
+        }
+
+        private void require(char expected) throws IOException {
+            if (!consume(expected)) fail("expected '" + expected + "'");
+        }
+
+        private void fail(String detail) throws IOException {
+            throw new IOException("Invalid JSON at character " + index + ": " + detail + ".");
+        }
     }
     
     private enum ResourceSyncMode {
@@ -987,6 +1192,79 @@ public final class ModUpdaterGUI {
         }
     }
 
+    private static final class ResourceHttpStatusException extends IOException {
+        final int statusCode;
+        final String retryAfter;
+        final String rateLimitRemaining;
+        final String rateLimitReset;
+        final String requestId;
+
+        ResourceHttpStatusException(
+                int statusCode,
+                String message,
+                String retryAfter,
+                String rateLimitRemaining,
+                String rateLimitReset,
+                String requestId) {
+            super(message);
+            this.statusCode = statusCode;
+            this.retryAfter = retryAfter;
+            this.rateLimitRemaining = rateLimitRemaining;
+            this.rateLimitReset = rateLimitReset;
+            this.requestId = requestId;
+        }
+
+        boolean isRateLimitExhausted() {
+            return "0".equals(rateLimitRemaining) || (retryAfter != null && retryAfter.length() > 0);
+        }
+    }
+
+    private static final class ResourceInstallException extends IOException {
+        ResourceInstallException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    private static final class ResourceArchiveVerificationException extends IOException {
+        ResourceArchiveVerificationException(String message) {
+            super(message);
+        }
+
+        ResourceArchiveVerificationException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    private static final class PreparedResourcePackState {
+        final ResourcePackManifest previous;
+        final ResourcePackRef remoteRef;
+        final ResourcePackRemoteTree remote;
+
+        PreparedResourcePackState(
+                ResourcePackManifest previous,
+                ResourcePackRef remoteRef,
+                ResourcePackRemoteTree remote) {
+            this.previous = previous;
+            this.remoteRef = remoteRef;
+            this.remote = remote;
+        }
+    }
+
+    private static final class ResourceDownloadSession {
+        private final Map<String, String> disabledHosts = new HashMap<String, String>();
+
+        synchronized String disabledReason(String url) {
+            return disabledHosts.get(resourceRequestHost(url));
+        }
+
+        synchronized boolean disable(String url, String reason) {
+            String host = resourceRequestHost(url);
+            if (disabledHosts.containsKey(host)) return false;
+            disabledHosts.put(host, reason);
+            return true;
+        }
+    }
+
     private static LauncherUpdateState checkLauncherUpdate(
             String repo,
             String assetRegex,
@@ -1051,6 +1329,72 @@ public final class ModUpdaterGUI {
             System.err.println("[mod-updater] Launcher self-update check failed: " + t.getMessage());
         }
         return state;
+    }
+
+    private static Lwjgl3PatchUpdateState checkLwjgl3PatchUpdate(
+            String repo,
+            String assetRegex,
+            Path instanceRoot) {
+        Lwjgl3PatchUpdateState state = new Lwjgl3PatchUpdateState();
+        state.patchFile = lwjgl3PatchPath(instanceRoot);
+        state.currentVersion = readLwjgl3PatchVersion(state.patchFile);
+        if (repo == null || repo.trim().length() == 0 || assetRegex == null || instanceRoot == null) {
+            return state;
+        }
+
+        try {
+            LatestRelease latest = fetchLatestRelease(repo.trim());
+            ReleaseAsset asset = selectExactOptionalAsset(latest.assets, assetRegex);
+            state.latest = latest;
+            state.asset = asset;
+            if (asset == null) {
+                System.err.println("[mod-updater] No LWJGL3 patch asset matched regex '" + assetRegex
+                        + "' in repo " + repo + ".");
+                return state;
+            }
+
+            boolean localPatchValid = false;
+            if (state.patchFile != null && Files.isRegularFile(state.patchFile)) {
+                try {
+                    state.currentVersion = validateLwjgl3Patch(state.patchFile);
+                    localPatchValid = true;
+                } catch (IOException invalidLocalPatch) {
+                    System.err.println("[mod-updater] Installed org.lwjgl.json is invalid: "
+                            + invalidLocalPatch.getMessage());
+                }
+            }
+
+            InstalledMarker marker = localPatchValid ? readMarker(state.patchFile) : null;
+            boolean releaseMatches = marker != null
+                    && equalsSafe(marker.tag, latest.tag)
+                    && equalsSafe(marker.assetName, asset.name);
+            state.updateAvailable = !localPatchValid || !releaseMatches;
+            if (state.updateAvailable) {
+                System.out.println("[mod-updater] LWJGL3 component patch update available"
+                        + (state.currentVersion != null ? " (installed " + state.currentVersion + ")" : "")
+                        + (latest.tag != null ? ": release " + latest.tag : "."));
+            }
+        } catch (Throwable t) {
+            // This auxiliary update source must not prevent the game updater from
+            // opening when GitHub is temporarily unavailable.
+            System.err.println("[mod-updater] LWJGL3 patch update check failed: " + t.getMessage());
+        }
+        return state;
+    }
+
+    private static Path lwjgl3PatchPath(Path instanceRoot) {
+        if (instanceRoot == null) return null;
+        return instanceRoot.resolve("patches").resolve("org.lwjgl.json");
+    }
+
+    private static String readLwjgl3PatchVersion(Path patchFile) {
+        if (patchFile == null || !Files.isRegularFile(patchFile)) return null;
+        try {
+            String json = new String(Files.readAllBytes(patchFile), StandardCharsets.UTF_8);
+            return extractString(json, "\\\"version\\\"\\s*:\\s*\\\"(.*?)\\\"");
+        } catch (IOException ex) {
+            return null;
+        }
     }
 
     private static Long fetchRemoteContentLength(String url) throws IOException {
@@ -1645,7 +1989,8 @@ public final class ModUpdaterGUI {
                                                 launcherState.minecraftDir,
                                                 ResourceSyncMode.SMART,
                                                 false,
-                                                launcherState.resourcePackCheckIntervalMs);
+                                                launcherState.resourcePackCheckIntervalMs,
+                                                launcherState.resourcePackArchiveMirrorUrl);
                                         logResourceSyncResult(syncResult);
                                     }
                                     // Install macOS patches if needed
@@ -1704,6 +2049,7 @@ public final class ModUpdaterGUI {
                         final ProgressUI ui = new EmbeddedProgressUI(progressCanvas);
                         Thread t = new Thread(new Runnable() {
                             public void run() {
+                                PreparedLwjgl3Patch preparedLwjgl3Patch = null;
                                 try {
                                     BranchContext ctx = fetchBranchState(
                                             launcherState != null && launcherState.useBetaUpdates,
@@ -1717,9 +2063,41 @@ public final class ModUpdaterGUI {
                                             mode,
                                             jarmodName);
 
-                                    runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.serverJarAsset, ctx.assetsZip, ctx.latest, jarmodName);
-                                    
                                     boolean forceResync = launcherState != null && launcherState.forceUpdate;
+                                    preparedLwjgl3Patch = prepareLwjgl3PatchUpdate(
+                                            ui,
+                                            launcherState != null ? launcherState.lwjgl3PatchUpdate : null,
+                                            instanceRoot,
+                                            forceResync);
+                                    if (forceResync || !ctx.upToDate) {
+                                        runUpdate(ui, minecraftDir, instanceRoot, mode, jarRegex, ctx.jarAsset, ctx.serverJarAsset, ctx.assetsZip, ctx.latest, jarmodName);
+                                    } else {
+                                        ui.log("Game patch and LAN server are already up to date.");
+                                    }
+
+                                    boolean lwjgl3Updated = installLwjgl3PatchUpdate(
+                                            ui,
+                                            preparedLwjgl3Patch);
+                                    preparedLwjgl3Patch = null;
+                                    if (lwjgl3Updated) {
+                                        ui.setPhaseText("Libraries updated - restart Prism Launcher");
+                                        ui.progress(100);
+                                        System.out.println("[mod-updater] LWJGL component metadata was replaced. "
+                                                + "Prism loaded the old metadata before the pre-launch command, so this launch is being cancelled. "
+                                                + "Restart Prism Launcher to load the new LWJGL version.");
+                                        try {
+                                            showLibrariesUpdatedDialog(frame);
+                                        } catch (InterruptedException interrupted) {
+                                            Thread.currentThread().interrupt();
+                                            System.err.println("[mod-updater] Libraries were updated, but the restart notice was interrupted.");
+                                        } catch (Exception dialogFailure) {
+                                            System.err.println("[mod-updater] Libraries were updated, but the restart notice could not be shown: "
+                                                    + dialogFailure.getMessage());
+                                        }
+                                        System.exit(PRE_LAUNCH_CANCELLED_EXIT_CODE);
+                                        return;
+                                    }
+
                                     ResourceSyncMode syncMode = forceResync ? ResourceSyncMode.FULL : ResourceSyncMode.SMART;
                                     boolean strictSync = forceResync;
                                     
@@ -1732,7 +2110,8 @@ public final class ModUpdaterGUI {
                                                 launcherState.minecraftDir,
                                                 syncMode,
                                                 strictSync,
-                                                launcherState.resourcePackCheckIntervalMs);
+                                                launcherState.resourcePackCheckIntervalMs,
+                                                launcherState.resourcePackArchiveMirrorUrl);
                                         logResourceSyncResult(syncResult);
                                         // Install macOS patches if needed
                                         installMacOSPatch(launcherState.instanceRoot);
@@ -1748,6 +2127,7 @@ public final class ModUpdaterGUI {
                                     }
                                     System.exit(0);
                                 } catch (Throwable ex) {
+                                    discardPreparedLwjgl3Patch(preparedLwjgl3Patch);
                                     showError(ex);
                                     System.exit(1);
                                 }
@@ -1760,6 +2140,17 @@ public final class ModUpdaterGUI {
                 noButton.addActionListener(new AbstractAction() {
                     public void actionPerformed(ActionEvent e) {
                         if (startMandatoryLauncherSelfUpdate(frame, launcherState, cardPanel, cards, bottomBg, root, progressCanvas)) {
+                            return;
+                        }
+                        if (launcherState != null
+                                && launcherState.lwjgl3PatchUpdate != null
+                                && launcherState.lwjgl3PatchUpdate.updateAvailable) {
+                            JOptionPane.showMessageDialog(
+                                    frame,
+                                    "This update includes required LWJGL component metadata.\n\n"
+                                            + "Install the update, then press Play once more so Prism can reload it.",
+                                    "LWJGL update required",
+                                    JOptionPane.WARNING_MESSAGE);
                             return;
                         }
                         // The user declined the game update. Do not contact the resource-pack
@@ -1985,6 +2376,23 @@ public final class ModUpdaterGUI {
         } catch (Exception ignored) {}
     }
 
+    private static void showLibrariesUpdatedDialog(final Component parent) throws Exception {
+        Runnable showDialog = new Runnable() {
+            public void run() {
+                JOptionPane.showMessageDialog(
+                        parent,
+                        "Libraries have been updated. Please restart Prism Launcher.",
+                        "Libraries updated",
+                        JOptionPane.INFORMATION_MESSAGE);
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            showDialog.run();
+        } else {
+            SwingUtilities.invokeAndWait(showDialog);
+        }
+    }
+
     private static void runLauncherSelfUpdate(
             final JFrame frame,
             final LauncherState launcherState,
@@ -2151,7 +2559,7 @@ public final class ModUpdaterGUI {
         });
         center.add(clearBackupsButton, c);
         
-        // Fetch Resources row - deletes resources folder and performs a full re-download.
+        // Fetch Resources row - downloads and validates a full archive before replacing files.
         c.gridx = 0;
         c.gridy = 4;
         c.weightx = 0;
@@ -2173,7 +2581,7 @@ public final class ModUpdaterGUI {
                 
                 int confirm = JOptionPane.showConfirmDialog(
                         dialog,
-                        "This will delete your local resources folder and re-download everything.\nContinue?",
+                        "This will re-download and replace all managed resource files.\nContinue?",
                         "Fetch Resources",
                         JOptionPane.YES_NO_OPTION,
                         JOptionPane.WARNING_MESSAGE);
@@ -2192,16 +2600,21 @@ public final class ModUpdaterGUI {
                 Thread worker = new Thread(new Runnable() {
                     public void run() {
                         try {
-                            Path resourcesDir = finalMinecraftDir.resolve("resources");
-                            deleteDirectoryTree(resourcesDir);
-                            
                             ResourceSyncResult syncResult = syncResourcePack(
                                     repo,
                                     branch,
                                     finalMinecraftDir,
                                     ResourceSyncMode.FULL,
-                                    true);
+                                    true,
+                                    DEFAULT_RESOURCE_CHECK_INTERVAL_MINUTES * 60000L,
+                                    launcherState != null ? launcherState.resourcePackArchiveMirrorUrl : null);
                             logResourceSyncResult(syncResult);
+                            final String resourceSource = syncResult.sourceUrl != null
+                                    ? syncResult.sourceUrl
+                                    : "the configured resource repository";
+                            final String resourceSourceBranch = syncResult.sourceBranch != null
+                                    ? syncResult.sourceBranch
+                                    : normalizeResourcePackBranch(branch);
                             
                             SwingUtilities.invokeLater(new Runnable() {
                                 public void run() {
@@ -2209,7 +2622,8 @@ public final class ModUpdaterGUI {
                                     fetchResourcesButton.setText("Fetch Resources");
                                     JOptionPane.showMessageDialog(
                                             dialog,
-                                            "Resources were fully re-downloaded from https://github.com/" + repo + " (" + normalizeResourcePackBranch(branch) + ").",
+                                            "Resources were fully re-downloaded from " + resourceSource
+                                                    + " (" + resourceSourceBranch + ").",
                                             "Fetch Resources",
                                             JOptionPane.INFORMATION_MESSAGE);
                                 }
@@ -2307,7 +2721,9 @@ public final class ModUpdaterGUI {
                 try {
                     BranchContext ctx = fetchBranchState(desiredBeta, releaseRepo, betaRepo, jarRegex, serverJarRegex, assetsRegex, minecraftDir, instanceRoot, mode, jarmodName);
                     launcherState.branch = ctx;
-                    launcherState.hasUpdate = !ctx.upToDate;
+                    launcherState.hasUpdate = !ctx.upToDate
+                            || (launcherState.lwjgl3PatchUpdate != null
+                                    && launcherState.lwjgl3PatchUpdate.updateAvailable);
                     launcherState.useBetaUpdates = desiredBeta;
 
                     SwingUtilities.invokeLater(new Runnable() {
@@ -2558,7 +2974,196 @@ public final class ModUpdaterGUI {
         moveOrCopy(downloaded, dest);
         writeMarker(dest, latest, serverJarAsset);
     }
-    
+
+    /**
+     * Installs a separately released Prism component patch at
+     * instanceRoot/patches/org.lwjgl.json.
+     *
+     * @return true when the component file was replaced. Prism loads component
+     *         metadata before running its pre-launch command, so callers must
+     *         cancel this launch and let the next launch reload the new file.
+     */
+    private static PreparedLwjgl3Patch prepareLwjgl3PatchUpdate(
+            ProgressUI ui,
+            Lwjgl3PatchUpdateState update,
+            Path instanceRoot,
+            boolean force) throws Exception {
+        if (update == null || update.asset == null || update.latest == null) return null;
+        if (!force && !update.updateAvailable) return null;
+        if (instanceRoot == null) {
+            throw new IllegalArgumentException("LWJGL3 patch update requires an instance root; pass --instanceDir.");
+        }
+        if (releaseAssetSha256(update.asset) == null) {
+            throw new IOException("LWJGL3 release asset has no valid GitHub SHA-256 digest; refusing an unverified component update.");
+        }
+
+        ui.setPhaseText("Verifying LWJGL component update...");
+        Path downloaded = downloadToTemp(ui, update.asset.url, update.asset.name, 0.0, 0.05);
+        Path staged = null;
+        try {
+            verifyReleaseAssetFile(downloaded, update.asset);
+            String lwjglVersion = validateLwjgl3Patch(downloaded);
+            Path target = lwjgl3PatchPath(instanceRoot);
+            ensureDir(target.getParent());
+            staged = Files.createTempFile(target.getParent(), "org.lwjgl.", ".pending");
+            Files.copy(downloaded, staged, StandardCopyOption.REPLACE_EXISTING);
+            verifyReleaseAssetFile(staged, update.asset);
+            return new PreparedLwjgl3Patch(update, target, staged, lwjglVersion);
+        } catch (Exception failure) {
+            if (staged != null) {
+                try { Files.deleteIfExists(staged); } catch (IOException ignored) {}
+            }
+            throw failure;
+        } finally {
+            try { Files.deleteIfExists(downloaded); } catch (IOException ignored) {}
+        }
+    }
+
+    private static boolean installLwjgl3PatchUpdate(
+            ProgressUI ui,
+            PreparedLwjgl3Patch prepared) throws Exception {
+        if (prepared == null) return false;
+        Lwjgl3PatchUpdateState update = prepared.update;
+        Path target = prepared.target;
+        Path staged = prepared.staged;
+        Path backup = target.resolveSibling("org.lwjgl.json.bak");
+        boolean hadExisting = Files.isRegularFile(target);
+        try {
+            if (hadExisting) {
+                ui.setPhaseText("Backing up LWJGL component metadata...");
+                Files.copy(target, backup, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            ui.setPhaseText("Installing LWJGL " + prepared.version + " metadata...");
+            try {
+                Files.move(staged, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException noAtomicMove) {
+                Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException replaceFailure) {
+                if (hadExisting && !Files.isRegularFile(target) && Files.isRegularFile(backup)) {
+                    try { Files.copy(backup, target, StandardCopyOption.REPLACE_EXISTING); } catch (IOException ignored) {}
+                }
+                throw replaceFailure;
+            }
+        } finally {
+            try { Files.deleteIfExists(staged); } catch (IOException ignored) {}
+        }
+
+        writeMarker(target, update.latest, update.asset);
+        update.patchFile = target;
+        update.currentVersion = prepared.version;
+        update.updateAvailable = false;
+        ui.log("Installed LWJGL component metadata " + prepared.version + " at " + target);
+        return true;
+    }
+
+    private static void discardPreparedLwjgl3Patch(PreparedLwjgl3Patch prepared) {
+        if (prepared == null || prepared.staged == null) return;
+        try { Files.deleteIfExists(prepared.staged); } catch (IOException ignored) {}
+    }
+
+    private static String validateLwjgl3Patch(Path patchFile) throws IOException {
+        if (patchFile == null || !Files.isRegularFile(patchFile)) {
+            throw new IOException("Downloaded LWJGL3 patch is missing.");
+        }
+        long size = Files.size(patchFile);
+        if (size < 256L || size > 10L * 1024L * 1024L) {
+            throw new IOException("Downloaded LWJGL3 patch has an implausible size: " + size + " bytes.");
+        }
+
+        String json = new String(Files.readAllBytes(patchFile), StandardCharsets.UTF_8);
+        JsonSyntaxValidator.validate(json);
+        int objectStart = firstNonWhitespace(json, 0);
+        if (objectStart < 0 || json.charAt(objectStart) != '{') {
+            throw new IOException("Downloaded LWJGL3 patch is not a JSON object.");
+        }
+        int objectEnd = findMatchingBrace(json, objectStart);
+        if (objectEnd < 0 || firstNonWhitespace(json, objectEnd + 1) >= 0) {
+            throw new IOException("Downloaded LWJGL3 patch contains incomplete or trailing JSON data.");
+        }
+
+        String uid = extractTopLevelJsonString(json, "uid");
+        String version = extractTopLevelJsonString(json, "version");
+        if (!"org.lwjgl".equals(uid)) {
+            throw new IOException("Downloaded LWJGL3 patch has uid '" + uid + "'; expected 'org.lwjgl'.");
+        }
+        if (findTopLevelJsonMemberValue(json, "conflicts") >= 0) {
+            throw new IOException("Downloaded LWJGL3 patch still declares component conflicts; expected the org.lwjgl override payload.");
+        }
+        if (version == null || !Pattern.compile("3\\.[0-9]+(?:\\.[0-9]+)?(?:[-+._][A-Za-z0-9.-]+)?").matcher(version).matches()) {
+            throw new IOException("Downloaded LWJGL3 patch has an invalid LWJGL 3 version: " + version);
+        }
+        int formatVersionStart = findTopLevelJsonMemberValue(json, "formatVersion");
+        if (formatVersionStart < 0
+                || !Pattern.compile("1(?:\\s*[,}])").matcher(json.substring(formatVersionStart)).lookingAt()) {
+            throw new IOException("Downloaded LWJGL3 patch does not use Prism formatVersion 1.");
+        }
+
+        int librariesStart = findTopLevelJsonMemberValue(json, "libraries");
+        if (librariesStart >= 0 && json.charAt(librariesStart) != '[') librariesStart = -1;
+        int librariesEnd = librariesStart >= 0 ? findMatchingBracket(json, librariesStart) : -1;
+        if (librariesStart < 0 || librariesEnd < 0) {
+            throw new IOException("Downloaded LWJGL3 patch does not contain a complete libraries array.");
+        }
+        String libraries = json.substring(librariesStart, librariesEnd + 1);
+        if (!Pattern.compile("\\\"name\\\"\\s*:\\s*\\\"org\\.lwjgl:lwjgl(?:[-A-Za-z0-9.]*)?:")
+                .matcher(libraries).find()) {
+            throw new IOException("Downloaded LWJGL3 patch does not contain LWJGL library coordinates.");
+        }
+        return version;
+    }
+
+    private static int firstNonWhitespace(String text, int start) {
+        if (text == null) return -1;
+        for (int i = Math.max(0, start); i < text.length(); i++) {
+            if (!Character.isWhitespace(text.charAt(i))) return i;
+        }
+        return -1;
+    }
+
+    private static int findTopLevelJsonMemberValue(String json, String requestedKey) {
+        int objectStart = firstNonWhitespace(json, 0);
+        if (objectStart < 0 || json.charAt(objectStart) != '{') return -1;
+        int depth = 0;
+        for (int i = objectStart; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '"') {
+                int stringEnd = findJsonStringEnd(json, i);
+                if (stringEnd < 0) return -1;
+                if (depth == 1) {
+                    int colon = firstNonWhitespace(json, stringEnd + 1);
+                    if (colon >= 0 && json.charAt(colon) == ':') {
+                        String key = unescapeJson(json.substring(i + 1, stringEnd));
+                        if (requestedKey.equals(key)) {
+                            return firstNonWhitespace(json, colon + 1);
+                        }
+                    }
+                }
+                i = stringEnd;
+            } else if (c == '{' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ']') {
+                depth--;
+            }
+        }
+        return -1;
+    }
+
+    private static String extractTopLevelJsonString(String json, String key) {
+        int valueStart = findTopLevelJsonMemberValue(json, key);
+        if (valueStart < 0 || json.charAt(valueStart) != '"') return null;
+        int valueEnd = findJsonStringEnd(json, valueStart);
+        if (valueEnd < 0) return null;
+        return unescapeJson(json.substring(valueStart + 1, valueEnd));
+    }
+
+    private static int findJsonStringEnd(String json, int quoteStart) {
+        for (int i = quoteStart + 1; i < json.length(); i++) {
+            if (json.charAt(i) == '"' && !isEscaped(json, i)) return i;
+        }
+        return -1;
+    }
+
     /**
      * Syncs the resource pack from a repository using either smart or full mode.
      *
@@ -2591,6 +3196,17 @@ public final class ModUpdaterGUI {
             ResourceSyncMode mode,
             boolean strict,
             long checkIntervalMs) throws IOException {
+        return syncResourcePack(repo, branch, minecraftDir, mode, strict, checkIntervalMs, null);
+    }
+
+    private static ResourceSyncResult syncResourcePack(
+            String repo,
+            String branch,
+            Path minecraftDir,
+            ResourceSyncMode mode,
+            boolean strict,
+            long checkIntervalMs,
+            String archiveMirrorUrl) throws IOException {
         ResourceSyncResult result = new ResourceSyncResult();
         result.mode = mode != null ? mode : ResourceSyncMode.SMART;
         
@@ -2615,6 +3231,8 @@ public final class ModUpdaterGUI {
         
         String repoTrimmed = repo.trim();
         String effectiveBranch = normalizeResourcePackBranch(branch);
+        IOException incrementalFailure = null;
+        boolean archiveRecovery = false;
         System.out.println("[mod-updater] Syncing resource pack from: " + repoTrimmed + " (branch=" + effectiveBranch + ", mode=" + result.mode + ")");
         if (result.mode == ResourceSyncMode.SMART) {
             System.out.println("[mod-updater] Incremental sync policy: download remote additions/changes and remove tracked remote deletions only.");
@@ -2628,11 +3246,17 @@ public final class ModUpdaterGUI {
             } catch (IOException e) {
                 String msg = e.getMessage() != null ? e.getMessage() : e.toString();
                 result.errors.add(msg);
-                if (strict) {
-                    throw new IOException("Incremental resource pack sync failed in strict mode: " + msg, e);
+                if (isResourceSyncInterrupted(e)) {
+                    if (strict) {
+                        throw new IOException("Incremental resource pack sync was interrupted: " + msg, e);
+                    }
+                    System.err.println("[mod-updater] Warning: Resource sync was interrupted; archive recovery was not started.");
+                    return result;
                 }
-                System.err.println("[mod-updater] Warning: Failed to sync resource pack incrementally: " + msg);
-                return result;
+                incrementalFailure = e;
+                archiveRecovery = true;
+                System.err.println("[mod-updater] Incremental resource sync failed: " + msg);
+                System.err.println("[mod-updater] Trying a full archive contingency before giving up.");
             }
         } else {
             System.out.println("[mod-updater] Full sync policy: re-download and replace all resource-pack assets.");
@@ -2640,12 +3264,18 @@ public final class ModUpdaterGUI {
         
         ResourceArchiveDownload archive = null;
         try {
-            archive = downloadResourcePackArchive(repoTrimmed, effectiveBranch, result);
+            archive = downloadResourcePackArchive(
+                    repoTrimmed,
+                    effectiveBranch,
+                    archiveMirrorUrl,
+                    minecraftDir,
+                    archiveRecovery ? ResourceSyncMode.FULL : result.mode,
+                    result);
             if (archive == null || archive.zipPath == null) {
                 String detail = result.describeFailure();
                 String msg = "Failed to download resource pack archive.";
                 if (strict) {
-                    throw new IOException(msg + (detail.length() > 0 ? " " + detail : ""));
+                    throw new IOException(msg + (detail.length() > 0 ? " " + detail : ""), incrementalFailure);
                 }
                 System.err.println("[mod-updater] Warning: " + msg + (detail.length() > 0 ? " " + detail : ""));
                 return result;
@@ -2653,21 +3283,12 @@ public final class ModUpdaterGUI {
             
             result.sourceUrl = archive.url;
             result.sourceBranch = archive.branch;
-            System.out.println("[mod-updater] Resource sync: downloaded archive from " + archive.url + " (branch=" + archive.branch + "), applying fixes...");
-            extractResourcePackArchive(archive.zipPath, minecraftDir, result.mode, result);
-            String archiveUrl = result.sourceUrl;
-            try {
-                recordFullResourcePackState(repoTrimmed, archive.branch, minecraftDir, result);
-            } catch (IOException manifestFailure) {
-                // The full archive has already been applied. Keep any prior manifest so
-                // the next incremental pass can retry reconciliation safely.
-                System.err.println("[mod-updater] Full resource sync completed, but incremental state could not be refreshed: "
-                        + manifestFailure.getMessage());
-            }
-            result.sourceUrl = archiveUrl;
             result.success = true;
             return result;
         } catch (IOException e) {
+            if (incrementalFailure != null && e != incrementalFailure) {
+                e.addSuppressed(incrementalFailure);
+            }
             String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             result.errors.add(msg);
             if (strict) {
@@ -2787,31 +3408,97 @@ public final class ModUpdaterGUI {
             }
         }
 
-        for (Map.Entry<String, Boolean> change : filesToDownload.entrySet()) {
-            String relativePath = change.getKey();
-            String blobSha = remote.files.get(relativePath);
-            Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
-            if (destination == null) {
-                throw new IOException("Unsafe resource path returned by GitHub: " + relativePath);
-            }
-            boolean existedBefore = Files.isRegularFile(destination);
-            System.out.println("[mod-updater] Downloading resource file: " + relativePath);
-            downloadResourcePackBlob(repo, commit, relativePath, blobSha, destination, result);
-            System.out.println("[mod-updater] Downloaded resource file: " + relativePath
-                    + " (blob=" + shortSha(blobSha) + ")");
-            result.copiedFiles++;
+        if (!filesToDownload.isEmpty()) {
+            final List<Map.Entry<String, Boolean>> changes =
+                    new ArrayList<Map.Entry<String, Boolean>>(filesToDownload.entrySet());
+            final ResourceDownloadSession downloadSession = new ResourceDownloadSession();
+            final Path resourcesRoot = minecraftDir.resolve("resources").normalize();
+            int workerCount = Math.min(RESOURCE_DOWNLOAD_THREADS, changes.size());
+            System.out.println("[mod-updater] Fetching resource files with " + workerCount
+                    + " parallel download thread(s).");
 
-            if (Boolean.TRUE.equals(change.getValue()) || !existedBefore) {
-                result.addedFilesDownloaded++;
-                result.missingFilesCopied++;
-                result.addMissingAssetDetail(relativePath);
-            } else {
-                result.changedFilesDownloaded++;
-                result.addChangedAssetDetail(relativePath);
+            List<Callable<Boolean>> downloadTasks = new ArrayList<Callable<Boolean>>(changes.size());
+            for (Map.Entry<String, Boolean> change : changes) {
+                final String relativePath = change.getKey();
+                final String blobSha = remote.files.get(relativePath);
+                final Path destination = resolveResourcePackDestination(minecraftDir, relativePath);
+                if (destination == null) {
+                    throw new IOException("Unsafe resource path returned by GitHub: " + relativePath);
+                }
+                final boolean existedBefore = Files.isRegularFile(destination);
+                downloadTasks.add(new Callable<Boolean>() {
+                    public Boolean call() throws IOException {
+                        System.out.println("[mod-updater] Downloading resource file: " + relativePath);
+                        String sourceHost = downloadResourcePackBlob(
+                                repo,
+                                commit,
+                                relativePath,
+                                blobSha,
+                                destination,
+                                result,
+                                downloadSession,
+                                resourcesRoot);
+                        System.out.println("[mod-updater] Downloaded resource file: " + relativePath
+                                + " (blob=" + shortSha(blobSha) + ", source=" + sourceHost + ")");
+                        return Boolean.valueOf(existedBefore);
+                    }
+                });
             }
-            if (isLanguageAssetPath(relativePath)) {
-                result.langFilesRefreshed++;
-                result.addRefreshedLanguageDetail(relativePath);
+
+            ExecutorService downloadExecutor = Executors.newFixedThreadPool(workerCount, new ThreadFactory() {
+                private int sequence = 1;
+
+                public synchronized Thread newThread(Runnable runnable) {
+                    Thread thread = new Thread(runnable, "ModUpdater-ResourceFetch-" + sequence++);
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            });
+            boolean downloadsFinished = false;
+            boolean restoreInterrupt = false;
+            try {
+                List<Future<Boolean>> downloads = downloadExecutor.invokeAll(downloadTasks);
+                downloadsFinished = true;
+                IOException firstFailure = null;
+                for (int i = 0; i < downloads.size(); i++) {
+                    Map.Entry<String, Boolean> change = changes.get(i);
+                    String relativePath = change.getKey();
+                    try {
+                        boolean existedBefore = downloads.get(i).get().booleanValue();
+                        result.copiedFiles++;
+
+                        if (Boolean.TRUE.equals(change.getValue()) || !existedBefore) {
+                            result.addedFilesDownloaded++;
+                            result.missingFilesCopied++;
+                            result.addMissingAssetDetail(relativePath);
+                        } else {
+                            result.changedFilesDownloaded++;
+                            result.addChangedAssetDetail(relativePath);
+                        }
+                        if (isLanguageAssetPath(relativePath)) {
+                            result.langFilesRefreshed++;
+                            result.addRefreshedLanguageDetail(relativePath);
+                        }
+                    } catch (ExecutionException failedDownload) {
+                        Throwable cause = failedDownload.getCause();
+                        IOException failure = cause instanceof IOException
+                                ? (IOException) cause
+                                : new IOException("Failed to download resource '" + relativePath + "'.", cause);
+                        if (firstFailure == null) {
+                            firstFailure = failure;
+                        } else {
+                            firstFailure.addSuppressed(failure);
+                        }
+                    }
+                }
+                if (firstFailure != null) {
+                    throw firstFailure;
+                }
+            } catch (InterruptedException interrupted) {
+                restoreInterrupt = true;
+                throw new IOException("Interrupted while downloading resource files.", interrupted);
+            } finally {
+                finishResourceDownloadExecutor(downloadExecutor, !downloadsFinished, restoreInterrupt);
             }
         }
 
@@ -2820,7 +3507,7 @@ public final class ModUpdaterGUI {
                 if (remote.files.containsKey(previousPath)) continue;
                 Path destination = resolveResourcePackDestination(minecraftDir, previousPath);
                 if (destination == null) continue;
-                if (Files.deleteIfExists(destination)) {
+                if (deleteSafeTrackedResourceFile(minecraftDir.resolve("resources"), destination)) {
                     System.out.println("[mod-updater] Removed resource file deleted upstream: " + previousPath);
                     result.removedFiles++;
                     result.addRemovedAssetDetail(previousPath);
@@ -2846,32 +3533,102 @@ public final class ModUpdaterGUI {
         return result;
     }
 
-    private static void recordFullResourcePackState(
+    private static void finishResourceDownloadExecutor(
+            ExecutorService executor,
+            boolean cancel,
+            boolean restoreInterrupt) {
+        if (cancel) {
+            executor.shutdownNow();
+        } else {
+            executor.shutdown();
+        }
+
+        boolean interruptedWhileWaiting = restoreInterrupt;
+        while (!executor.isTerminated()) {
+            try {
+                executor.awaitTermination(1L, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                interruptedWhileWaiting = true;
+                executor.shutdownNow();
+            }
+        }
+        if (interruptedWhileWaiting) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static PreparedResourcePackState prepareFullResourcePackState(
             String repo,
             String branch,
-            Path minecraftDir,
+            Path validationMinecraftDir,
+            Path manifestMinecraftDir,
             ResourceSyncResult result) throws IOException {
-        Path manifestPath = resourcePackManifestPath(minecraftDir);
+        Path manifestPath = resourcePackManifestPath(manifestMinecraftDir);
         ResourcePackManifest previous = readResourcePackManifest(manifestPath);
         ResourcePackRef remoteRef = fetchResourcePackRef(repo, branch, result);
         ResourcePackRemoteTree remote = fetchResourcePackTree(repo, remoteRef.branch, remoteRef.commit, result);
 
-        // Ensure the archive and metadata describe the same content before recording
-        // the commit. A branch push racing the archive download will be retried later.
-        for (Map.Entry<String, String> entry : remote.files.entrySet()) {
-            Path destination = resolveResourcePackDestination(minecraftDir, entry.getKey());
-            if (destination == null
-                    || !Files.isRegularFile(destination)
-                    || !equalsSafe(computeGitBlobSha(destination), entry.getValue())) {
-                throw new IOException("Resource archive did not match current branch commit at " + entry.getKey() + ".");
+        // Ensure the archive and metadata describe the exact same content before
+        // promoting staged files. A branch push racing the archive download will
+        // be retried later without touching the live resource tree.
+        try {
+            for (Map.Entry<String, String> entry : remote.files.entrySet()) {
+                Path destination = resolveResourcePackDestination(validationMinecraftDir, entry.getKey());
+                if (destination == null
+                        || !Files.isRegularFile(destination, LinkOption.NOFOLLOW_LINKS)
+                        || !equalsSafe(computeGitBlobSha(destination), entry.getValue())) {
+                    throw new ResourceArchiveVerificationException(
+                            "Resource archive did not match current branch commit at " + entry.getKey() + ".");
+                }
             }
+
+            Set<String> stagedPaths = listStagedResourcePackPaths(validationMinecraftDir);
+            for (String stagedPath : stagedPaths) {
+                if (!remote.files.containsKey(stagedPath)) {
+                    throw new ResourceArchiveVerificationException(
+                            "Resource archive contained an untracked file: " + stagedPath + ".");
+                }
+            }
+        } catch (ResourceArchiveVerificationException mismatch) {
+            throw mismatch;
+        } catch (IOException validationFailure) {
+            throw new ResourceArchiveVerificationException(
+                    "Resource archive could not be verified before promotion.",
+                    validationFailure);
         }
 
-        if (previous != null && equalsSafe(previous.repo, repo)) {
-            for (String previousPath : previous.files.keySet()) {
-                if (remote.files.containsKey(previousPath)) continue;
+        return new PreparedResourcePackState(previous, remoteRef, remote);
+    }
+
+    private static Set<String> listStagedResourcePackPaths(Path minecraftDir) throws IOException {
+        final Path resourcesDir = minecraftDir.resolve("resources").normalize();
+        final Set<String> paths = new HashSet<String>();
+        Files.walkFileTree(resourcesDir, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                String relativePath = resourcesDir.relativize(file).toString().replace('\\', '/');
+                if (!isSafeResourcePackPath(relativePath)) {
+                    throw new IOException("Unsafe staged resource path: " + relativePath);
+                }
+                paths.add(relativePath);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return paths;
+    }
+
+    private static void recordPreparedResourcePackState(
+            String repo,
+            Path minecraftDir,
+            PreparedResourcePackState prepared,
+            ResourceSyncResult result) throws IOException {
+        Path manifestPath = resourcePackManifestPath(minecraftDir);
+        if (prepared.previous != null && equalsSafe(prepared.previous.repo, repo)) {
+            for (String previousPath : prepared.previous.files.keySet()) {
+                if (prepared.remote.files.containsKey(previousPath)) continue;
                 Path destination = resolveResourcePackDestination(minecraftDir, previousPath);
-                if (destination != null && Files.deleteIfExists(destination)) {
+                if (destination != null
+                        && deleteSafeTrackedResourceFile(minecraftDir.resolve("resources"), destination)) {
                     result.removedFiles++;
                     result.addRemovedAssetDetail(previousPath);
                     pruneEmptyResourceDirectories(destination.getParent(), minecraftDir.resolve("resources"));
@@ -2881,13 +3638,13 @@ public final class ModUpdaterGUI {
 
         ResourcePackManifest updated = new ResourcePackManifest();
         updated.repo = repo;
-        updated.branch = remoteRef.branch;
-        updated.commit = remoteRef.commit;
+        updated.branch = prepared.remoteRef.branch;
+        updated.commit = prepared.remoteRef.commit;
         updated.checkedAt = System.currentTimeMillis();
-        updated.files.putAll(remote.files);
+        updated.files.putAll(prepared.remote.files);
         writeResourcePackManifest(manifestPath, updated);
-        result.sourceBranch = remoteRef.branch;
-        result.sourceCommit = remoteRef.commit;
+        result.sourceBranch = prepared.remoteRef.branch;
+        result.sourceCommit = prepared.remoteRef.commit;
     }
 
     private static String fetchResourcePackCommit(String repo, String branch, ResourceSyncResult result) throws IOException {
@@ -2964,60 +3721,138 @@ public final class ModUpdaterGUI {
     }
 
     private static String fetchGitHubJson(String url, ResourceSyncResult result, String label) throws IOException {
-        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
-        conn.setRequestMethod("GET");
-        conn.setRequestProperty("Accept", "application/vnd.github+json");
-        String token = getenv("GITHUB_TOKEN");
-        if (token != null && !token.trim().isEmpty()) {
-            conn.setRequestProperty("Authorization", "token " + token.trim());
+        IOException lastFailure = null;
+        for (int attempt = 1; attempt <= RESOURCE_ENDPOINT_RETRIES; attempt++) {
+            HttpURLConnection conn = null;
+            InputStream in = null;
+            try {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedIOException("Resource metadata request was interrupted before connecting.");
+                }
+                conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+                conn.setRequestMethod("GET");
+                conn.setRequestProperty("Accept", "application/vnd.github+json");
+                String token = getenv("GITHUB_TOKEN");
+                if (token != null && !token.trim().isEmpty()) {
+                    conn.setRequestProperty("Authorization", "token " + token.trim());
+                }
+                int code = conn.getResponseCode();
+                in = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
+                String body = readAll(in);
+                if (code < 200 || code >= 300) {
+                    throw resourceHttpStatusFailure(conn, code, body);
+                }
+                addResourceAttempt(result, url + " [" + label + " metadata, try=" + attempt + "/"
+                        + RESOURCE_ENDPOINT_RETRIES + "] -> OK");
+                return body;
+            } catch (IOException failure) {
+                lastFailure = failure;
+                String detail = failure.getMessage() != null ? failure.getMessage() : failure.toString();
+                addResourceAttempt(result, url + " [" + label + " metadata, try=" + attempt + "/"
+                        + RESOURCE_ENDPOINT_RETRIES + "] -> FAIL: " + detail);
+                if (isResourceSyncInterrupted(failure)) {
+                    throw failure;
+                }
+                if (attempt >= RESOURCE_ENDPOINT_RETRIES || !isRetryableResourceFailure(failure)) {
+                    throw new IOException("GitHub resource " + label + " metadata -> " + detail, failure);
+                }
+                System.err.println("[mod-updater] Resource " + label + " metadata request failed transiently ("
+                        + detail + "). Retrying...");
+                pauseBeforeResourceRetry(attempt);
+            } finally {
+                if (in != null) {
+                    try { in.close(); } catch (IOException ignored) {}
+                }
+                if (conn != null) conn.disconnect();
+            }
         }
-        int code = conn.getResponseCode();
-        InputStream in = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
-        String body = readAll(in);
-        if (code < 200 || code >= 300) {
-            String failure = label + " metadata -> HTTP " + code + " " + truncateErrorBody(body);
-            if (result != null) result.attempts.add(url + " -> FAIL: " + failure);
-            throw new IOException("GitHub resource " + failure);
-        }
-        if (result != null) result.attempts.add(url + " -> OK");
-        return body;
+        throw new IOException("GitHub resource " + label + " metadata failed.", lastFailure);
     }
 
-    private static void downloadResourcePackBlob(
+    private static String downloadResourcePackBlob(
             String repo,
             String commit,
             String relativePath,
             String expectedBlobSha,
             Path destination,
-            ResourceSyncResult result) throws IOException {
-        ensureDir(destination.getParent());
+            ResourceSyncResult result,
+            ResourceDownloadSession session,
+            Path resourcesRoot) throws IOException {
+        ensureSafeResourceDestination(resourcesRoot, destination);
         List<String> urls = new ArrayList<String>();
+        urls.add("https://cdn.jsdelivr.net/gh/" + repo + "@" + commit + "/" + encodeUrlPath(relativePath));
         urls.add("https://raw.githubusercontent.com/" + repo + "/" + commit + "/" + encodeUrlPath(relativePath));
         urls.add("https://api.github.com/repos/" + repo + "/git/blobs/" + expectedBlobSha);
 
         IOException lastFailure = null;
         for (String url : urls) {
-            Path temporary = Files.createTempFile(destination.getParent(), ".mcose-resource-", ".tmp");
-            try {
-                downloadResourceUrl(url, temporary, url.contains("api.github.com/"));
-                String downloadedSha = computeGitBlobSha(temporary);
-                if (!equalsSafe(expectedBlobSha, downloadedSha)) {
-                    throw new IOException("Downloaded resource hash mismatch for " + relativePath
-                            + " (expected " + expectedBlobSha + ", received " + downloadedSha + ").");
-                }
+            String disabledReason = session != null ? session.disabledReason(url) : null;
+            if (disabledReason != null) {
+                continue;
+            }
+            for (int attempt = 1; attempt <= RESOURCE_ENDPOINT_RETRIES; attempt++) {
+                Path temporary = Files.createTempFile(destination.getParent(), ".mcose-resource-", ".tmp");
+                String attemptLabel = url + " [try=" + attempt + "/" + RESOURCE_ENDPOINT_RETRIES + "]";
                 try {
-                    Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                } catch (AtomicMoveNotSupportedException unsupported) {
-                    Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+                    downloadResourceUrl(url, temporary, url.contains("api.github.com/"));
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new InterruptedIOException("Resource download interrupted for " + relativePath + ".");
+                    }
+                    String downloadedSha = computeGitBlobSha(temporary);
+                    if (!equalsSafe(expectedBlobSha, downloadedSha)) {
+                        throw new IOException("Downloaded resource hash mismatch for " + relativePath
+                                + " (expected " + expectedBlobSha + ", received " + downloadedSha + ").");
+                    }
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new InterruptedIOException("Resource download interrupted for " + relativePath + ".");
+                    }
+                    try {
+                        ensureSafeResourceDestination(resourcesRoot, destination);
+                        Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                    } catch (AtomicMoveNotSupportedException unsupported) {
+                        try {
+                            ensureSafeResourceDestination(resourcesRoot, destination);
+                            Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+                        } catch (IOException installFailure) {
+                            throw new ResourceInstallException(
+                                    "Failed to install downloaded resource '" + relativePath + "'.",
+                                    installFailure);
+                        }
+                    } catch (IOException installFailure) {
+                        throw new ResourceInstallException(
+                                "Failed to install downloaded resource '" + relativePath + "'.",
+                                installFailure);
+                    }
+                    return resourceRequestHost(url);
+                } catch (IOException failure) {
+                    if (failure instanceof ResourceInstallException) {
+                        throw failure;
+                    }
+                    lastFailure = failure;
+                    String detail = failure.getMessage() != null ? failure.getMessage() : failure.toString();
+                    addResourceAttempt(result, attemptLabel + " -> FAIL: " + detail);
+                    if (isResourceSyncInterrupted(failure)) {
+                        throw failure;
+                    }
+                    boolean retry = attempt < RESOURCE_ENDPOINT_RETRIES && isRetryableResourceFailure(failure);
+                    System.err.println("[mod-updater] Resource download source failed for " + relativePath
+                            + " (" + attemptLabel + "): " + detail
+                            + (retry ? "; retrying this source." : "; trying the next source."));
+                    if (retry) {
+                        pauseBeforeResourceRetry(attempt);
+                    } else {
+                        if (session != null
+                                && shouldDisableResourceProvider(failure)
+                                && session.disable(url, detail)) {
+                            System.err.println("[mod-updater] Resource provider " + resourceRequestHost(url)
+                                    + " is unavailable for this run; queued files will use the next source. Cause: "
+                                    + detail);
+                        }
+                        break;
+                    }
+                } finally {
+                    try { Files.deleteIfExists(temporary); } catch (IOException ignored) {}
                 }
-                return;
-            } catch (IOException failure) {
-                lastFailure = failure;
-                result.attempts.add(url + " -> FAIL: " + failure.getMessage());
-                System.err.println("[mod-updater] Resource download source failed for " + relativePath
-                        + " (" + url + "): " + failure.getMessage());
-            } finally {
-                try { Files.deleteIfExists(temporary); } catch (IOException ignored) {}
             }
         }
         throw new IOException("Failed to download changed resource '" + relativePath + "': "
@@ -3025,32 +3860,139 @@ public final class ModUpdaterGUI {
     }
 
     private static void downloadResourceUrl(String url, Path destination, boolean githubApi) throws IOException {
-        HttpURLConnection conn = openHttpConnection(url, RESOURCE_ARCHIVE_TIMEOUT_MS, RESOURCE_ARCHIVE_TIMEOUT_MS, "ModUpdaterGUI/1.0");
-        conn.setRequestMethod("GET");
-        if (githubApi) {
-            conn.setRequestProperty("Accept", "application/vnd.github.raw+json");
-            String token = getenv("GITHUB_TOKEN");
-            if (token != null && !token.trim().isEmpty()) {
-                conn.setRequestProperty("Authorization", "token " + token.trim());
-            }
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("Resource download interrupted before connecting.");
         }
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) {
-            InputStream err = conn.getErrorStream();
-            String body = err != null ? readAll(err) : "";
-            throw new IOException("HTTP " + code + " " + truncateErrorBody(body));
-        }
-        InputStream in = new BufferedInputStream(conn.getInputStream());
-        OutputStream out = Files.newOutputStream(destination, StandardOpenOption.TRUNCATE_EXISTING);
-        byte[] buffer = new byte[64 * 1024];
+        HttpURLConnection conn = null;
+        InputStream in = null;
+        OutputStream out = null;
         try {
-            int count;
-            while ((count = in.read(buffer)) != -1) {
+            conn = openHttpConnection(url, RESOURCE_ARCHIVE_TIMEOUT_MS, RESOURCE_ARCHIVE_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+            conn.setRequestMethod("GET");
+            if (githubApi) {
+                conn.setRequestProperty("Accept", "application/vnd.github.raw+json");
+                String token = getenv("GITHUB_TOKEN");
+                if (token != null && !token.trim().isEmpty()) {
+                    conn.setRequestProperty("Authorization", "token " + token.trim());
+                }
+            }
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                in = conn.getErrorStream();
+                String body = in != null ? readAll(in) : "";
+                throw resourceHttpStatusFailure(conn, code, body);
+            }
+            in = new BufferedInputStream(conn.getInputStream());
+            out = Files.newOutputStream(destination, StandardOpenOption.TRUNCATE_EXISTING);
+            byte[] buffer = new byte[64 * 1024];
+            while (true) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedIOException("Resource download interrupted while reading " + url + ".");
+                }
+                int count = in.read(buffer);
+                if (count == -1) break;
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedIOException("Resource download interrupted while reading " + url + ".");
+                }
                 out.write(buffer, 0, count);
             }
         } finally {
-            try { in.close(); } catch (IOException ignored) {}
-            try { out.close(); } catch (IOException ignored) {}
+            if (in != null) {
+                try { in.close(); } catch (IOException ignored) {}
+            }
+            if (out != null) {
+                try { out.close(); } catch (IOException ignored) {}
+            }
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static ResourceHttpStatusException resourceHttpStatusFailure(
+            HttpURLConnection conn,
+            int statusCode,
+            String body) {
+        String retryAfter = conn != null ? conn.getHeaderField("Retry-After") : null;
+        String remaining = conn != null ? conn.getHeaderField("X-RateLimit-Remaining") : null;
+        String reset = conn != null ? conn.getHeaderField("X-RateLimit-Reset") : null;
+        String requestId = conn != null ? conn.getHeaderField("X-GitHub-Request-Id") : null;
+        StringBuilder message = new StringBuilder("HTTP ").append(statusCode);
+        if (remaining != null) message.append(" rate-limit-remaining=").append(remaining);
+        if (reset != null) message.append(" rate-limit-reset=").append(reset);
+        if (retryAfter != null) message.append(" retry-after=").append(retryAfter);
+        if (requestId != null) message.append(" request-id=").append(requestId);
+        String detail = truncateErrorBody(body);
+        if (detail.length() > 0) message.append(' ').append(detail);
+        return new ResourceHttpStatusException(
+                statusCode,
+                message.toString(),
+                retryAfter,
+                remaining,
+                reset,
+                requestId);
+    }
+
+    private static boolean isRetryableResourceFailure(IOException failure) {
+        if (isResourceSyncInterrupted(failure)) return false;
+        if (failure instanceof ResourceHttpStatusException) {
+            ResourceHttpStatusException http = (ResourceHttpStatusException) failure;
+            if (http.isRateLimitExhausted()) return false;
+            return http.statusCode == 408
+                    || http.statusCode == 425
+                    || http.statusCode == 429
+                    || http.statusCode >= 500;
+        }
+        return true;
+    }
+
+    private static boolean shouldDisableResourceProvider(IOException failure) {
+        if (isResourceSyncInterrupted(failure)) return false;
+        if (failure instanceof ResourceInstallException) return false;
+        if (failure instanceof ResourceHttpStatusException) {
+            int status = ((ResourceHttpStatusException) failure).statusCode;
+            return status == 401
+                    || status == 403
+                    || status == 408
+                    || status == 425
+                    || status == 429
+                    || status == 451
+                    || status >= 500;
+        }
+        return true;
+    }
+
+    private static String resourceRequestHost(String url) {
+        try {
+            String host = new URL(url).getHost();
+            return host != null && host.length() > 0 ? host : url;
+        } catch (Exception invalidUrl) {
+            return url;
+        }
+    }
+
+    private static boolean isResourceSyncInterrupted(Throwable failure) {
+        if (Thread.currentThread().isInterrupted()) return true;
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof InterruptedException) return true;
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static void pauseBeforeResourceRetry(int completedAttempt) throws IOException {
+        long delay = RESOURCE_ENDPOINT_RETRY_BASE_DELAY_MS * Math.max(1, completedAttempt);
+        try {
+            Thread.sleep(delay);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("Interrupted while waiting to retry a resource request.");
+        }
+    }
+
+    private static void addResourceAttempt(ResourceSyncResult result, String attempt) {
+        if (result == null || attempt == null) return;
+        synchronized (result.attempts) {
+            result.attempts.add(attempt);
         }
     }
 
@@ -3155,6 +4097,108 @@ public final class ModUpdaterGUI {
         return destination.startsWith(resourcesDir) ? destination : null;
     }
 
+    private static void ensureSafeResourceDestination(Path resourcesDir, Path destination) throws IOException {
+        if (resourcesDir == null || destination == null) {
+            throw new IOException("Resource destination is unavailable.");
+        }
+        Path root = resourcesDir.toAbsolutePath().normalize();
+        Path target = destination.toAbsolutePath().normalize();
+        if (target.equals(root) || !target.startsWith(root)) {
+            throw new IOException("Unsafe resource destination outside the resources directory: " + target);
+        }
+
+        if (Files.isSymbolicLink(root)) {
+            throw new IOException("Refusing to write through a symbolic-link resources directory: " + root);
+        }
+        if (Files.exists(root, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Resource root is not a directory: " + root);
+            }
+        } else {
+            Files.createDirectories(root);
+        }
+
+        Path realRoot = root.toRealPath();
+        Path parent = target.getParent();
+        Path current = root;
+        for (Path segment : root.relativize(parent)) {
+            current = current.resolve(segment);
+            if (Files.isSymbolicLink(current)) {
+                throw new IOException("Refusing to write through a symbolic link in resources: " + current);
+            }
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Resource path component is not a directory: " + current);
+                }
+            } else {
+                try {
+                    Files.createDirectory(current);
+                } catch (FileAlreadyExistsException racedCreation) {
+                    // Another resource worker may have created the same safe
+                    // parent between the existence check and this call.
+                }
+                if (Files.isSymbolicLink(current)
+                        || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Unsafe resource path component appeared during download: " + current);
+                }
+            }
+            if (!current.toRealPath().startsWith(realRoot)) {
+                throw new IOException("Resource path resolves outside the resources directory: " + current);
+            }
+        }
+
+        if (Files.isSymbolicLink(target)) {
+            throw new IOException("Refusing to replace a symbolic-link resource file: " + target);
+        }
+        if (!parent.toRealPath().startsWith(realRoot)) {
+            throw new IOException("Resource destination resolves outside the resources directory: " + target);
+        }
+    }
+
+    private static boolean deleteSafeTrackedResourceFile(Path resourcesDir, Path destination) throws IOException {
+        if (resourcesDir == null || destination == null) {
+            throw new IOException("Tracked resource deletion target is unavailable.");
+        }
+        Path root = resourcesDir.toAbsolutePath().normalize();
+        Path target = destination.toAbsolutePath().normalize();
+        if (target.equals(root) || !target.startsWith(root)) {
+            throw new IOException("Unsafe tracked resource deletion outside the resources directory: " + target);
+        }
+        if (Files.isSymbolicLink(root)) {
+            throw new IOException("Refusing to delete through a symbolic-link resources directory: " + root);
+        }
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return false;
+        if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Resource root is not a directory: " + root);
+        }
+
+        Path realRoot = root.toRealPath();
+        Path parent = target.getParent();
+        Path current = root;
+        for (Path segment : root.relativize(parent)) {
+            current = current.resolve(segment);
+            if (Files.isSymbolicLink(current)) {
+                throw new IOException("Refusing to delete through a symbolic link in resources: " + current);
+            }
+            if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) return false;
+            if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Resource deletion path component is not a directory: " + current);
+            }
+            if (!current.toRealPath().startsWith(realRoot)) {
+                throw new IOException("Resource deletion path resolves outside the resources directory: " + current);
+            }
+        }
+
+        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return false;
+        if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(target)) {
+            throw new IOException("Refusing to delete a directory as a tracked resource file: " + target);
+        }
+        if (!parent.toRealPath().startsWith(realRoot)) {
+            throw new IOException("Tracked resource deletion resolves outside the resources directory: " + target);
+        }
+        return Files.deleteIfExists(target);
+    }
+
     private static boolean isSafeResourcePackPath(String relativePath) {
         if (relativePath == null) return false;
         String normalized = relativePath.replace('\\', '/');
@@ -3218,6 +4262,49 @@ public final class ModUpdaterGUI {
             return hex.toString();
         } catch (GeneralSecurityException unavailable) {
             throw new IOException("SHA-1 is unavailable for Git resource comparison.", unavailable);
+        }
+    }
+
+    private static String releaseAssetSha256(ReleaseAsset asset) {
+        if (asset == null || asset.digest == null) return null;
+        Matcher matcher = Pattern.compile("(?i)^sha256:([0-9a-f]{64})$").matcher(asset.digest.trim());
+        return matcher.matches() ? matcher.group(1).toLowerCase(Locale.ROOT) : null;
+    }
+
+    private static String sha256Hex(Path path) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            InputStream in = Files.newInputStream(path);
+            byte[] buffer = new byte[64 * 1024];
+            try {
+                int count;
+                while ((count = in.read(buffer)) != -1) {
+                    digest.update(buffer, 0, count);
+                }
+            } finally {
+                try { in.close(); } catch (IOException ignored) {}
+            }
+            byte[] hash = digest.digest();
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                hex.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+            }
+            return hex.toString();
+        } catch (GeneralSecurityException unavailable) {
+            throw new IOException("SHA-256 is unavailable for release asset verification.", unavailable);
+        }
+    }
+
+    private static void verifyReleaseAssetFile(Path file, ReleaseAsset asset) throws IOException {
+        if (asset != null && asset.size != null && Files.size(file) != asset.size.longValue()) {
+            throw new IOException("Downloaded asset size does not match GitHub release metadata.");
+        }
+        String expectedSha256 = releaseAssetSha256(asset);
+        if (expectedSha256 != null) {
+            String actualSha256 = sha256Hex(file);
+            if (!expectedSha256.equals(actualSha256)) {
+                throw new IOException("Downloaded asset SHA-256 does not match GitHub release metadata.");
+            }
         }
     }
 
@@ -3308,8 +4395,14 @@ public final class ModUpdaterGUI {
         }
     }
     
-    private static ResourceArchiveDownload downloadResourcePackArchive(String repo, String branch, ResourceSyncResult result) {
-        List<ResourceArchiveCandidate> candidates = buildResourceArchiveCandidates(repo, branch);
+    private static ResourceArchiveDownload downloadResourcePackArchive(
+            String repo,
+            String branch,
+            String archiveMirrorUrl,
+            Path minecraftDir,
+            ResourceSyncMode mode,
+            ResourceSyncResult result) throws IOException {
+        List<ResourceArchiveCandidate> candidates = buildResourceArchiveCandidates(repo, branch, archiveMirrorUrl);
         if (candidates.isEmpty()) {
             System.err.println("[mod-updater] Resource sync: no archive candidates were generated.");
             return null;
@@ -3325,16 +4418,41 @@ public final class ModUpdaterGUI {
                             candidate.url,
                             "resourcepack-" + sanitizeTempName(repo) + "-" + sanitizeTempName(candidate.branch) + "-" + System.currentTimeMillis() + "-" + attempt + ".zip",
                             RESOURCE_ARCHIVE_TIMEOUT_MS);
-                    if (!isValidZipArchive(downloaded)) {
-                        throw new IOException("Downloaded file is not a valid ZIP archive.");
+                    if (!isValidResourcePackArchive(downloaded)) {
+                        throw new IOException("Downloaded file is not a valid resource-pack ZIP archive.");
                     }
-                    result.attempts.add(label + " -> OK");
+                    System.out.println("[mod-updater] Resource sync: downloaded archive from "
+                            + candidate.url + " (branch=" + candidate.branch
+                            + "), staging and verifying before installation...");
+                    applyStagedResourcePackArchive(
+                            downloaded,
+                            repo,
+                            candidate.branch,
+                            minecraftDir,
+                            mode,
+                            result);
+                    addResourceAttempt(result, label + " -> OK");
                     return new ResourceArchiveDownload(downloaded, candidate.url, candidate.branch);
                 } catch (IOException ex) {
-                    String err = ex.getMessage() != null ? ex.getMessage() : ex.toString();
-                    result.attempts.add(label + " -> FAIL: " + err);
+                    String err = describeResourceIOException(ex);
+                    addResourceAttempt(result, label + " -> FAIL: " + err);
                     result.errors.add(label + " -> " + err);
-                    if (attempt < RESOURCE_ARCHIVE_RETRIES) {
+                    if (isResourceSyncInterrupted(ex)) {
+                        if (downloaded != null) {
+                            try { Files.deleteIfExists(downloaded); } catch (IOException ignored) {}
+                        }
+                        throw ex;
+                    }
+                    if (ex instanceof ResourceInstallException) {
+                        if (downloaded != null) {
+                            try { Files.deleteIfExists(downloaded); } catch (IOException ignored) {}
+                        }
+                        throw ex;
+                    }
+                    boolean retry = !(ex instanceof ResourceArchiveVerificationException)
+                            && attempt < RESOURCE_ARCHIVE_RETRIES
+                            && isRetryableResourceFailure(ex);
+                    if (retry) {
                         System.err.println("[mod-updater] Resource sync: source failed (" + err + "). Retrying same source...");
                     } else {
                         System.err.println("[mod-updater] Resource sync: source exhausted (" + err + "). Moving to next fallback source...");
@@ -3342,8 +4460,10 @@ public final class ModUpdaterGUI {
                     if (downloaded != null) {
                         try { Files.deleteIfExists(downloaded); } catch (IOException ignored) {}
                     }
-                    if (attempt < RESOURCE_ARCHIVE_RETRIES) {
-                        sleepQuietly(RESOURCE_ARCHIVE_RETRY_BASE_DELAY_MS * attempt);
+                    if (retry) {
+                        pauseBeforeResourceRetryDelay(RESOURCE_ARCHIVE_RETRY_BASE_DELAY_MS * attempt);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -3351,7 +4471,10 @@ public final class ModUpdaterGUI {
         return null;
     }
     
-    private static List<ResourceArchiveCandidate> buildResourceArchiveCandidates(String repo, String preferredBranch) {
+    private static List<ResourceArchiveCandidate> buildResourceArchiveCandidates(
+            String repo,
+            String preferredBranch,
+            String archiveMirrorUrl) throws IOException {
         String branch = normalizeResourcePackBranch(preferredBranch);
         List<String> branches = new ArrayList<String>();
         branches.add(branch);
@@ -3360,16 +4483,62 @@ public final class ModUpdaterGUI {
         }
         
         List<ResourceArchiveCandidate> urls = new ArrayList<ResourceArchiveCandidate>();
+        Set<String> seenUrls = new HashSet<String>();
+        boolean mirrorRejected = false;
         for (String b : branches) {
-            urls.add(new ResourceArchiveCandidate("https://github.com/" + repo + "/archive/refs/heads/" + b + ".zip", b));
-            urls.add(new ResourceArchiveCandidate("https://codeload.github.com/" + repo + "/zip/refs/heads/" + b, b));
-        }
-        
-        // Fallback mirror after all GitHub endpoints
-        for (String b : branches) {
-            urls.add(new ResourceArchiveCandidate("https://cdn.jsdelivr.net/gh/" + repo + "@" + b + "/.zip", b));
+            String expandedMirror = null;
+            if (!mirrorRejected) {
+                try {
+                    expandedMirror = expandResourceArchiveMirrorUrl(archiveMirrorUrl, repo, b);
+                } catch (IOException invalidMirror) {
+                    mirrorRejected = true;
+                    System.err.println("[mod-updater] Ignoring resource archive mirror: "
+                            + invalidMirror.getMessage());
+                }
+            }
+            addResourceArchiveCandidate(
+                    urls,
+                    seenUrls,
+                    "https://github.com/" + repo + "/archive/refs/heads/" + encodeUrlPath(b) + ".zip",
+                    b);
+            addResourceArchiveCandidate(
+                    urls,
+                    seenUrls,
+                    "https://codeload.github.com/" + repo + "/zip/refs/heads/" + encodeUrlPath(b),
+                    b);
+            addResourceArchiveCandidate(
+                    urls,
+                    seenUrls,
+                    expandedMirror,
+                    b);
         }
         return urls;
+    }
+
+    private static void addResourceArchiveCandidate(
+            List<ResourceArchiveCandidate> candidates,
+            Set<String> seenUrls,
+            String url,
+            String branch) {
+        if (url == null || url.length() == 0 || !seenUrls.add(url)) return;
+        candidates.add(new ResourceArchiveCandidate(url, branch));
+    }
+
+    private static String expandResourceArchiveMirrorUrl(String template, String repo, String branch) throws IOException {
+        if (template == null || template.trim().length() == 0) return null;
+        String expanded = template.trim()
+                .replace("{repo}", encodeUrlPath(repo))
+                .replace("{branch}", encodeUrlPath(branch));
+        URL parsed;
+        try {
+            parsed = new URL(expanded);
+        } catch (Exception invalid) {
+            throw new IOException("Invalid resourcePackArchiveMirrorUrl after placeholder expansion.", invalid);
+        }
+        if (!"https".equalsIgnoreCase(parsed.getProtocol()) || parsed.getUserInfo() != null) {
+            throw new IOException("resourcePackArchiveMirrorUrl must be a public HTTPS URL without embedded credentials.");
+        }
+        return expanded;
     }
     
     private static String normalizeResourcePackBranch(String branch) {
@@ -3377,13 +4546,211 @@ public final class ModUpdaterGUI {
         String trimmed = branch.trim();
         return trimmed.length() > 0 ? trimmed : "main";
     }
-    
+
+    private static void applyStagedResourcePackArchive(
+            Path zipPath,
+            String repo,
+            String branch,
+            Path minecraftDir,
+            ResourceSyncMode mode,
+            ResourceSyncResult result) throws IOException {
+        ensureDir(minecraftDir);
+        Path stagingRoot = Files.createTempDirectory(minecraftDir, ".mcose-resource-stage-");
+        try {
+            ResourceSyncResult stagingResult = new ResourceSyncResult();
+            stagingResult.mode = ResourceSyncMode.FULL;
+            try {
+                extractResourcePackArchive(
+                        zipPath,
+                        stagingRoot,
+                        ResourceSyncMode.FULL,
+                        stagingResult,
+                        false);
+            } catch (IOException invalidArchive) {
+                throw new ResourceArchiveVerificationException(
+                        "Resource archive could not be fully staged and verified.",
+                        invalidArchive);
+            }
+
+            PreparedResourcePackState preparedState = null;
+            try {
+                preparedState = prepareFullResourcePackState(
+                        repo,
+                        branch,
+                        stagingRoot,
+                        minecraftDir,
+                        result);
+            } catch (ResourceArchiveVerificationException mismatch) {
+                throw mismatch;
+            } catch (IOException metadataUnavailable) {
+                if (isResourceSyncInterrupted(metadataUnavailable)) {
+                    throw metadataUnavailable;
+                }
+                // The complete archive is staged and structurally verified, but
+                // GitHub metadata may be the endpoint that is unavailable in the
+                // affected region. Invalidate the old manifest before promotion
+                // so the next successful metadata pass hashes every live file.
+                System.err.println("[mod-updater] Resource archive is staged, but current metadata could not be verified: "
+                        + metadataUnavailable.getMessage());
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedIOException(
+                        "Resource archive installation was cancelled before staged files were promoted.");
+            }
+
+            if (preparedState == null) {
+                result.sourceCommit = null;
+                try {
+                    Files.deleteIfExists(resourcePackManifestPath(minecraftDir));
+                } catch (IOException manifestFailure) {
+                    throw new ResourceInstallException(
+                            "Could not invalidate unverified resource sync state before installation.",
+                            manifestFailure);
+                }
+            }
+
+            try {
+                installStagedResourceFiles(stagingRoot, minecraftDir, mode, result);
+            } catch (IOException installFailure) {
+                throw new ResourceInstallException(
+                        "Could not install the fully staged resource archive.",
+                        installFailure);
+            }
+            if (preparedState != null) {
+                try {
+                    recordPreparedResourcePackState(repo, minecraftDir, preparedState, result);
+                } catch (IOException manifestFailure) {
+                    System.err.println("[mod-updater] Full resource sync completed, but incremental state could not be refreshed: "
+                            + manifestFailure.getMessage());
+                }
+            }
+        } finally {
+            try {
+                deleteResourceStagingTree(stagingRoot, minecraftDir);
+            } catch (IOException cleanupFailure) {
+                System.err.println("[mod-updater] Warning: Could not remove resource staging directory "
+                        + stagingRoot + ": " + cleanupFailure.getMessage());
+            }
+        }
+    }
+
+    private static void installStagedResourceFiles(
+            Path stagingRoot,
+            Path minecraftDir,
+            final ResourceSyncMode mode,
+            final ResourceSyncResult result) throws IOException {
+        final Path stagedResources = stagingRoot.resolve("resources").normalize();
+        final Path liveResources = minecraftDir.resolve("resources").normalize();
+        if (!Files.isDirectory(stagedResources, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Staged resource archive did not create a resources directory.");
+        }
+
+        Files.walkFileTree(stagedResources, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path stagedFile, BasicFileAttributes attrs) throws IOException {
+                Path relative = stagedResources.relativize(stagedFile).normalize();
+                String relativePath = relative.toString().replace('\\', '/');
+                if (!isSafeResourcePackPath(relativePath)) {
+                    throw new IOException("Unsafe staged resource path: " + relativePath);
+                }
+                Path destination = liveResources.resolve(relative).normalize();
+                ensureSafeResourceDestination(liveResources, destination);
+
+                boolean isLanguageFile = isLanguageAssetPath(relativePath);
+                boolean existedBefore = Files.exists(destination, LinkOption.NOFOLLOW_LINKS);
+                if (mode == ResourceSyncMode.SMART && existedBefore && !isLanguageFile) {
+                    result.skippedExistingFiles++;
+                    return FileVisitResult.CONTINUE;
+                }
+
+                byte[] previousLanguageBytes = null;
+                if (isLanguageFile && existedBefore) {
+                    try {
+                        previousLanguageBytes = Files.readAllBytes(destination);
+                    } catch (IOException ignored) {}
+                }
+
+                try {
+                    Files.move(
+                            stagedFile,
+                            destination,
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException unsupported) {
+                    ensureSafeResourceDestination(liveResources, destination);
+                    Files.move(stagedFile, destination, StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                result.copiedFiles++;
+                if (mode == ResourceSyncMode.FULL) {
+                    System.out.println("[mod-updater] Full resource file installed: " + relativePath);
+                } else if (!existedBefore) {
+                    result.missingFilesCopied++;
+                    result.addMissingAssetDetail(relativePath);
+                }
+                if (isLanguageFile) {
+                    result.langFilesRefreshed++;
+                    result.addRefreshedLanguageDetail(relativePath);
+                    if (existedBefore) {
+                        boolean changed = true;
+                        try {
+                            byte[] currentBytes = Files.readAllBytes(destination);
+                            if (previousLanguageBytes != null) {
+                                changed = !Arrays.equals(previousLanguageBytes, currentBytes);
+                            }
+                        } catch (IOException ignored) {}
+                        System.out.println("[mod-updater] Language overwrite applied (content "
+                                + (changed ? "updated" : "unchanged") + "): " + relativePath);
+                    } else {
+                        System.out.println("[mod-updater] Language file missing; installed latest version: " + relativePath);
+                    }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private static void deleteResourceStagingTree(Path stagingRoot, Path minecraftDir) throws IOException {
+        Path root = stagingRoot.toAbsolutePath().normalize();
+        Path parent = minecraftDir.toAbsolutePath().normalize();
+        Path fileName = root.getFileName();
+        if (!root.startsWith(parent)
+                || fileName == null
+                || !fileName.toString().startsWith(".mcose-resource-stage-")) {
+            throw new IOException("Refusing to remove an unrecognized resource staging path: " + root);
+        }
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return;
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path directory, IOException failure) throws IOException {
+                if (failure != null) throw failure;
+                Files.deleteIfExists(directory);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
     private static void extractResourcePackArchive(Path zipPath, Path minecraftDir, ResourceSyncMode mode, ResourceSyncResult result) throws IOException {
+        extractResourcePackArchive(zipPath, minecraftDir, mode, result, true);
+    }
+
+    private static void extractResourcePackArchive(
+            Path zipPath,
+            Path minecraftDir,
+            ResourceSyncMode mode,
+            ResourceSyncResult result,
+            boolean logChanges) throws IOException {
         Path resourcesDir = minecraftDir.resolve("resources").normalize();
-        Path assetsRoot = resourcesDir.resolve("assets").normalize();
-        ensureDir(assetsRoot);
         
         byte[] buf = new byte[64 * 1024];
+        int extractedResourceFiles = 0;
         ZipInputStream zis = new ZipInputStream(new BufferedInputStream(new FileInputStream(zipPath.toFile())));
         try {
             ZipEntry entry;
@@ -3459,15 +4826,16 @@ public final class ModUpdaterGUI {
                     } catch (IOException ignored) {}
                 }
                 
-                ensureDir(dest.getParent());
+                ensureSafeResourceDestination(resourcesDir, dest);
                 try {
                     if (replaceExisting) {
                         Files.copy(zis, dest, StandardCopyOption.REPLACE_EXISTING);
                     } else {
                         Files.copy(zis, dest);
                     }
+                    extractedResourceFiles++;
                     result.copiedFiles++;
-                    if (mode == ResourceSyncMode.FULL) {
+                    if (mode == ResourceSyncMode.FULL && logChanges) {
                         System.out.println("[mod-updater] Full resource file installed: " + relNorm);
                     }
                     if (isLangFile) {
@@ -3481,12 +4849,12 @@ public final class ModUpdaterGUI {
                                     changed = !Arrays.equals(previousLangBytes, currentBytes);
                                 }
                             } catch (IOException ignored) {}
-                            if (changed) {
+                            if (changed && logChanges) {
                                 System.out.println("[mod-updater] Language overwrite applied (updated content): " + relNorm);
-                            } else {
+                            } else if (logChanges) {
                                 System.out.println("[mod-updater] Language overwrite applied (content unchanged): " + relNorm);
                             }
-                        } else {
+                        } else if (logChanges) {
                             System.out.println("[mod-updater] Language file missing; installed latest version: " + relNorm);
                         }
                     } else if (mode == ResourceSyncMode.SMART) {
@@ -3500,6 +4868,9 @@ public final class ModUpdaterGUI {
             }
         } finally {
             try { zis.close(); } catch (IOException ignored) {}
+        }
+        if (extractedResourceFiles == 0) {
+            throw new IOException("Resource archive did not contain any supported assets/ or data/ files.");
         }
     }
     
@@ -3515,43 +4886,74 @@ public final class ModUpdaterGUI {
     }
     
     private static Path downloadUrlToTempWithTimeout(String url, String suggestedName, int timeoutMs) throws IOException {
-        String tmpDir = System.getProperty("java.io.tmpdir");
-        Path tmp = Paths.get(tmpDir, suggestedName);
-        HttpURLConnection conn = openHttpConnection(url, timeoutMs, timeoutMs, "ModUpdaterGUI/1.0");
-        conn.setUseCaches(false);
-        conn.setRequestProperty("Cache-Control", "no-cache, no-store, max-age=0");
-        conn.setRequestProperty("Pragma", "no-cache");
-        conn.setInstanceFollowRedirects(true);
-        
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) {
-            InputStream err = conn.getErrorStream();
-            String body = err != null ? readAll(err) : "";
-            throw new IOException("HTTP " + code + " " + truncateErrorBody(body));
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("Resource archive download was interrupted before connecting.");
         }
-        
-        InputStream in = new BufferedInputStream(conn.getInputStream());
-        FileOutputStream out = new FileOutputStream(tmp.toFile());
-        byte[] buf = new byte[64 * 1024];
-        int n;
+        String tempPrefix = sanitizeTempName(suggestedName);
+        if (tempPrefix.length() > 64) tempPrefix = tempPrefix.substring(0, 64);
+        while (tempPrefix.length() < 3) tempPrefix += "_";
+        Path tmp = Files.createTempFile(tempPrefix + "-", ".part");
+        HttpURLConnection conn = null;
+        InputStream in = null;
+        FileOutputStream out = null;
+        boolean completed = false;
         try {
-            while ((n = in.read(buf)) != -1) {
+            conn = openHttpConnection(url, timeoutMs, timeoutMs, "ModUpdaterGUI/1.0");
+            conn.setUseCaches(false);
+            conn.setRequestProperty("Cache-Control", "no-cache, no-store, max-age=0");
+            conn.setRequestProperty("Pragma", "no-cache");
+            conn.setInstanceFollowRedirects(true);
+
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                in = conn.getErrorStream();
+                String body = in != null ? readAll(in) : "";
+                throw resourceHttpStatusFailure(conn, code, body);
+            }
+
+            in = new BufferedInputStream(conn.getInputStream());
+            out = new FileOutputStream(tmp.toFile());
+            byte[] buf = new byte[64 * 1024];
+            while (true) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedIOException("Resource archive download was interrupted while reading " + url + ".");
+                }
+                int n = in.read(buf);
+                if (n == -1) break;
                 out.write(buf, 0, n);
             }
+            completed = true;
+            return tmp;
         } finally {
-            try { in.close(); } catch (IOException ignored) {}
-            try { out.close(); } catch (IOException ignored) {}
+            if (in != null) {
+                try { in.close(); } catch (IOException ignored) {}
+            }
+            if (out != null) {
+                try { out.close(); } catch (IOException ignored) {}
+            }
+            if (conn != null) conn.disconnect();
+            if (!completed) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            }
         }
-        return tmp;
     }
     
-    private static boolean isValidZipArchive(Path zipPath) {
+    private static boolean isValidResourcePackArchive(Path zipPath) {
         if (zipPath == null || !Files.isRegularFile(zipPath)) return false;
         ZipFile zip = null;
         try {
             zip = new ZipFile(zipPath.toFile());
-            zip.entries();
-            return true;
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (entry.isDirectory()) continue;
+                String name = entry.getName().replace('\\', '/');
+                int slash = name.indexOf('/');
+                if (slash < 0 || slash + 1 >= name.length()) continue;
+                String relativePath = name.substring(slash + 1);
+                if (isSafeResourcePackPath(relativePath)) return true;
+            }
+            return false;
         } catch (IOException ignored) {
             return false;
         } finally {
@@ -3561,12 +4963,13 @@ public final class ModUpdaterGUI {
         }
     }
     
-    private static void sleepQuietly(long millis) {
+    private static void pauseBeforeResourceRetryDelay(long millis) throws IOException {
         if (millis <= 0) return;
         try {
             Thread.sleep(millis);
-        } catch (InterruptedException ignored) {
+        } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+            throw new InterruptedIOException("Interrupted while waiting to retry a resource archive request.");
         }
     }
     
@@ -4115,6 +5518,14 @@ public final class ModUpdaterGUI {
         }
         return null;
     }
+
+    private static String describeResourceIOException(IOException failure) {
+        String message = failure.getMessage() != null ? failure.getMessage() : failure.toString();
+        Throwable cause = failure.getCause();
+        if (cause == null || cause == failure) return message;
+        String causeMessage = cause.getMessage() != null ? cause.getMessage() : cause.toString();
+        return message + " [" + cause.getClass().getSimpleName() + ": " + causeMessage + "]";
+    }
     
     private static X509TrustManager loadTrustManager(KeyStore keyStore) throws GeneralSecurityException {
         TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
@@ -4260,21 +5671,61 @@ public final class ModUpdaterGUI {
     }
 
     private static List<ReleaseAsset> extractAssets(String json) {
-        // Robust scan based solely on browser_download_url; derive the name from the URL tail
         List<ReleaseAsset> list = new ArrayList<ReleaseAsset>();
-        Pattern p = Pattern.compile("\\\"browser_download_url\\\"\\s*:\\s*\\\"(.*?)\\\"", Pattern.DOTALL);
-        Matcher m = p.matcher(json);
-        while (m.find()) {
-            String url = unescapeJson(m.group(1));
-            String name = url;
-            int slash = url.lastIndexOf('/');
-            if (slash >= 0 && slash + 1 < url.length()) name = url.substring(slash + 1);
-            ReleaseAsset a = new ReleaseAsset();
-            a.name = name;
-            a.url = url;
-            list.add(a);
+        int assetsKey = json != null ? json.indexOf("\"assets\"") : -1;
+        int arrayStart = assetsKey >= 0 ? json.indexOf('[', assetsKey) : -1;
+        int arrayEnd = arrayStart >= 0 ? findMatchingBracket(json, arrayStart) : -1;
+        if (arrayStart >= 0 && arrayEnd >= 0) {
+            int cursor = arrayStart + 1;
+            while (cursor < arrayEnd) {
+                int objectStart = json.indexOf('{', cursor);
+                if (objectStart < 0 || objectStart >= arrayEnd) break;
+                int objectEnd = findMatchingBrace(json, objectStart);
+                if (objectEnd < 0 || objectEnd > arrayEnd) break;
+                String object = json.substring(objectStart, objectEnd + 1);
+                String url = extractString(object, "\\\"browser_download_url\\\"\\s*:\\s*\\\"(.*?)\\\"");
+                if (url != null) {
+                    ReleaseAsset asset = new ReleaseAsset();
+                    asset.url = url;
+                    asset.name = extractString(object, "\\\"name\\\"\\s*:\\s*\\\"(.*?)\\\"");
+                    if (asset.name == null || asset.name.length() == 0) {
+                        int slash = url.lastIndexOf('/');
+                        asset.name = slash >= 0 && slash + 1 < url.length() ? url.substring(slash + 1) : url;
+                    }
+                    asset.digest = extractString(object, "\\\"digest\\\"\\s*:\\s*\\\"(.*?)\\\"");
+                    asset.size = extractLong(object, "\\\"size\\\"\\s*:\\s*([0-9]+)");
+                    list.add(asset);
+                }
+                cursor = objectEnd + 1;
+            }
+        }
+
+        // Compatibility fallback for older or non-standard release responses.
+        if (list.isEmpty()) {
+            Pattern p = Pattern.compile("\\\"browser_download_url\\\"\\s*:\\s*\\\"(.*?)\\\"", Pattern.DOTALL);
+            Matcher m = p.matcher(json);
+            while (m.find()) {
+                String url = unescapeJson(m.group(1));
+                String name = url;
+                int slash = url.lastIndexOf('/');
+                if (slash >= 0 && slash + 1 < url.length()) name = url.substring(slash + 1);
+                ReleaseAsset asset = new ReleaseAsset();
+                asset.name = name;
+                asset.url = url;
+                list.add(asset);
+            }
         }
         return list;
+    }
+
+    private static Long extractLong(String text, String regex) {
+        Matcher matcher = Pattern.compile(regex, Pattern.DOTALL).matcher(text);
+        if (!matcher.find()) return null;
+        try {
+            return Long.valueOf(matcher.group(1));
+        } catch (NumberFormatException invalidNumber) {
+            return null;
+        }
     }
 
     // Simple HTML builder for the embedded patch-notes view, using the GitHub
@@ -4424,37 +5875,60 @@ public final class ModUpdaterGUI {
         return selectAsset(assets, assetRegex);
     }
 
+    private static ReleaseAsset selectExactOptionalAsset(List<ReleaseAsset> assets, String assetRegex) {
+        if (assetRegex == null || assetRegex.trim().length() == 0) return null;
+        Pattern pattern = Pattern.compile(assetRegex);
+        for (ReleaseAsset asset : assets) {
+            if (pattern.matcher(asset.name).matches()) return asset;
+        }
+        return null;
+    }
+
     private static Path downloadToTemp(ProgressUI ui, String url, String suggestedName, double start, double end) throws IOException {
         String tmpDir = System.getProperty("java.io.tmpdir");
-        Path tmp = Paths.get(tmpDir, suggestedName);
-        HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) {
-            InputStream err = conn.getErrorStream();
-            String body = err != null ? readAll(err) : "";
-            throw new IOException("Download failed: HTTP " + code + "\n" + body);
-        }
-        InputStream in = new BufferedInputStream(conn.getInputStream());
-        FileOutputStream out = new FileOutputStream(tmp.toFile());
-        byte[] buf = new byte[64 * 1024];
-        int n;
-        long total = 0;
-        long len = -1L;
-        try { len = conn.getContentLengthLong(); } catch (Throwable ignored) {}
+        String prefix = suggestedName != null ? suggestedName.replaceAll("[^A-Za-z0-9._-]", "_") : "download";
+        while (prefix.length() < 3) prefix = prefix + "_";
+        Path tmp = Files.createTempFile(Paths.get(tmpDir), prefix + ".", ".download");
         try {
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-                total += n;
-                if (len > 0L) {
-                    double frac = start + (end - start) * (total / (double) len);
-                    ui.progress((int) Math.round(frac * 100));
+            HttpURLConnection conn = openHttpConnection(url, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, "ModUpdaterGUI/1.0");
+            try {
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    InputStream err = conn.getErrorStream();
+                    String body = err != null ? readAll(err) : "";
+                    throw new IOException("Download failed: HTTP " + code + "\n" + body);
                 }
+                InputStream in = new BufferedInputStream(conn.getInputStream());
+                FileOutputStream out = new FileOutputStream(tmp.toFile());
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                long total = 0;
+                long len = -1L;
+                try { len = conn.getContentLengthLong(); } catch (Throwable ignored) {}
+                try {
+                    while ((n = in.read(buf)) != -1) {
+                        out.write(buf, 0, n);
+                        total += n;
+                        if (len > 0L) {
+                            double frac = start + (end - start) * (total / (double) len);
+                            ui.progress((int) Math.round(frac * 100));
+                        }
+                    }
+                } finally {
+                    try { in.close(); } catch (IOException ignored) {}
+                    try { out.close(); } catch (IOException ignored) {}
+                }
+            } finally {
+                conn.disconnect();
             }
-        } finally {
-            try { in.close(); } catch (IOException ignored) {}
-            try { out.close(); } catch (IOException ignored) {}
+            return tmp;
+        } catch (IOException failure) {
+            try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            throw failure;
+        } catch (RuntimeException failure) {
+            try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            throw failure;
         }
-        return tmp;
     }
 
     private static String readAll(InputStream in) throws IOException {
@@ -4516,31 +5990,6 @@ public final class ModUpdaterGUI {
         return parent.resolve(name + suffix + "." + stamp);
     }
     
-    /**
-     * Deletes a directory tree recursively. Symlinks are deleted as links.
-     */
-    private static void deleteDirectoryTree(Path dir) throws IOException {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                Files.deleteIfExists(file);
-                return FileVisitResult.CONTINUE;
-            }
-            
-            @Override
-            public FileVisitResult postVisitDirectory(Path directory, IOException exc) throws IOException {
-                if (exc != null) {
-                    throw exc;
-                }
-                Files.deleteIfExists(directory);
-                return FileVisitResult.CONTINUE;
-            }
-        });
-    }
-
     /**
      * Clears all .bak backup files from the jarmods directory.
      * These are the old version jars that were renamed during updates.
@@ -5147,6 +6596,8 @@ public final class ModUpdaterGUI {
     private static final class ReleaseAsset {
         String name;
         String url;
+        String digest;
+        Long size;
     }
     
     private static Path findBgPath(Path minecraftDir) {
@@ -5781,6 +7232,7 @@ public final class ModUpdaterGUI {
                 "  \"tag\": \"" + safe(release.tag) + "\",\n" +
                 "  \"asset\": \"" + safe(asset.name) + "\",\n" +
                 "  \"url\": \"" + safe(asset.url) + "\",\n" +
+                "  \"digest\": \"" + safe(asset.digest) + "\",\n" +
                 "  \"installedAt\": " + System.currentTimeMillis() + "\n" +
                 "}\n";
             Path marker = jarPath.resolveSibling(jarPath.getFileName().toString() + ".mcose.json");
@@ -5797,6 +7249,7 @@ public final class ModUpdaterGUI {
             InstalledMarker m = new InstalledMarker();
             m.tag = extractString(text, "\\\"tag\\\"\\s*:\\s*\\\"(.*?)\\\"");
             m.assetName = extractString(text, "\\\"asset\\\"\\s*:\\s*\\\"(.*?)\\\"");
+            m.digest = extractString(text, "\\\"digest\\\"\\s*:\\s*\\\"(.*?)\\\"");
             return m;
         } catch (Exception e) {
             return null;
@@ -5809,6 +7262,7 @@ public final class ModUpdaterGUI {
     private static final class InstalledMarker {
         String tag;
         String assetName;
+        String digest;
     }
 }
 

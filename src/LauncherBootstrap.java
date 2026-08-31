@@ -8,6 +8,25 @@
 // initializers from touching AWT prior to the relaunch.
 public final class LauncherBootstrap {
 
+    private static final String[] NETWORK_RELAUNCH_PROPERTIES = {
+        "java.net.useSystemProxies",
+        "http.proxyHost",
+        "http.proxyPort",
+        "https.proxyHost",
+        "https.proxyPort",
+        "http.nonProxyHosts",
+        "socksProxyHost",
+        "socksProxyPort",
+        "socksProxyVersion",
+        "java.net.preferIPv4Stack",
+        "java.net.preferIPv6Addresses",
+        "javax.net.ssl.trustStore",
+        "javax.net.ssl.trustStoreType",
+        "javax.net.ssl.trustStoreProvider",
+        "https.protocols",
+        "jdk.tls.client.protocols"
+    };
+
     public static void main(String[] args) {
         // If we are on Steam Deck / gamescope and not already using X11, relaunch
         // the JVM with GDK_BACKEND=x11 so Swing renders correctly.
@@ -53,6 +72,7 @@ public final class LauncherBootstrap {
 
             java.util.List<String> cmd = new java.util.ArrayList<>();
             cmd.add(javaBin);
+            appendNetworkRelaunchProperties(cmd);
             cmd.add("-cp");
             cmd.add(classpath);
             cmd.add(LauncherBootstrap.class.getName());
@@ -76,5 +96,18 @@ public final class LauncherBootstrap {
             return false;
         }
     }
-}
 
+    /**
+     * Preserve non-secret networking settings across the gamescope relaunch.
+     * Environment variables are inherited by ProcessBuilder already; arbitrary
+     * JVM arguments and credential-bearing properties are intentionally omitted.
+     */
+    private static void appendNetworkRelaunchProperties(java.util.List<String> command) {
+        for (String name : NETWORK_RELAUNCH_PROPERTIES) {
+            String value = System.getProperty(name);
+            if (value != null) {
+                command.add("-D" + name + "=" + value);
+            }
+        }
+    }
+}
