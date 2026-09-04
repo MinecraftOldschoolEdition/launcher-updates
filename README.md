@@ -40,7 +40,9 @@ Cross‑platform updater for Prism Launcher / MultiMC instances or simple batch 
 - A new LWJGL release tag triggers installation even when its `org.lwjgl.json` bytes are identical to the previous release.
 - It validates the GitHub SHA-256 digest, JSON syntax, Prism component schema, `uid=org.lwjgl`, and LWJGL 3 version before replacing `patches/org.lwjgl.json` atomically.
 - The previous component file is retained as `patches/org.lwjgl.json.bak`.
-- Prism loads component metadata before its pre-launch command, so a successful LWJGL component update shows a restart notice and cancels that launch. Restart Prism Launcher to reload the new component and continue.
+- Launcher Options includes **Re-fetch LWJGL JSON**, which performs a fresh release lookup and verified replacement even when the installed release marker already matches.
+- A successful manual re-fetch shows `Exit the launcher and restart PrismMC for the changes to take effect` and cancels that launch after the notice is acknowledged.
+- Prism loads component metadata before its pre-launch command, so a successful automatic LWJGL update also shows its restart notice and cancels that launch.
 - Publish the matching game `patch.jar` and LWJGL component payload as one coordinated release boundary; do not update version strings without the corresponding artifact URLs, sizes, and hashes.
 
 ## Config Keys

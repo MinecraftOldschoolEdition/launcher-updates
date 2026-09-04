@@ -236,6 +236,10 @@ public final class ModUpdaterGUI {
 
     /** Non-zero status tells Prism that the pre-launch command was cancelled. */
     private static final int PRE_LAUNCH_CANCELLED_EXIT_CODE = 2;
+
+    /** Instructions shown after replacing Prism's LWJGL component metadata. */
+    private static final String LWJGL_RESTART_MESSAGE =
+            "Exit the launcher and restart PrismMC for the changes to take effect";
     
     /** Resource archive download timeout in milliseconds (45 seconds). */
     private static final int RESOURCE_ARCHIVE_TIMEOUT_MS = 45000;
@@ -477,6 +481,8 @@ public final class ModUpdaterGUI {
             // =================================================================
             // Package all state into a single object for the GUI
             LauncherState state = new LauncherState();
+            state.lwjgl3Repo = lwjgl3Repo;
+            state.lwjgl3AssetRegex = lwjgl3AssetRegex;
             state.lwjgl3PatchUpdate = checkLwjgl3PatchUpdate(
                     lwjgl3Repo,
                     lwjgl3AssetRegex,
@@ -777,6 +783,8 @@ public final class ModUpdaterGUI {
         long resourcePackCheckIntervalMs;
         Path minecraftDir;
         String[] launchArgs;
+        String lwjgl3Repo;
+        String lwjgl3AssetRegex;
         Lwjgl3PatchUpdateState lwjgl3PatchUpdate;
     }
 
@@ -1335,6 +1343,23 @@ public final class ModUpdaterGUI {
             String repo,
             String assetRegex,
             Path instanceRoot) {
+        try {
+            return fetchLwjgl3PatchUpdateState(repo, assetRegex, instanceRoot);
+        } catch (Throwable t) {
+            // This auxiliary update source must not prevent the game updater from
+            // opening when GitHub is temporarily unavailable.
+            System.err.println("[mod-updater] LWJGL3 patch update check failed: " + t.getMessage());
+        }
+        Lwjgl3PatchUpdateState state = new Lwjgl3PatchUpdateState();
+        state.patchFile = lwjgl3PatchPath(instanceRoot);
+        state.currentVersion = readLwjgl3PatchVersion(state.patchFile);
+        return state;
+    }
+
+    private static Lwjgl3PatchUpdateState fetchLwjgl3PatchUpdateState(
+            String repo,
+            String assetRegex,
+            Path instanceRoot) throws IOException {
         Lwjgl3PatchUpdateState state = new Lwjgl3PatchUpdateState();
         state.patchFile = lwjgl3PatchPath(instanceRoot);
         state.currentVersion = readLwjgl3PatchVersion(state.patchFile);
@@ -1342,42 +1367,36 @@ public final class ModUpdaterGUI {
             return state;
         }
 
-        try {
-            LatestRelease latest = fetchLatestRelease(repo.trim());
-            ReleaseAsset asset = selectExactOptionalAsset(latest.assets, assetRegex);
-            state.latest = latest;
-            state.asset = asset;
-            if (asset == null) {
-                System.err.println("[mod-updater] No LWJGL3 patch asset matched regex '" + assetRegex
-                        + "' in repo " + repo + ".");
-                return state;
-            }
+        LatestRelease latest = fetchLatestRelease(repo.trim());
+        ReleaseAsset asset = selectExactOptionalAsset(latest.assets, assetRegex);
+        state.latest = latest;
+        state.asset = asset;
+        if (asset == null) {
+            System.err.println("[mod-updater] No LWJGL3 patch asset matched regex '" + assetRegex
+                    + "' in repo " + repo + ".");
+            return state;
+        }
 
-            boolean localPatchValid = false;
-            if (state.patchFile != null && Files.isRegularFile(state.patchFile)) {
-                try {
-                    state.currentVersion = validateLwjgl3Patch(state.patchFile);
-                    localPatchValid = true;
-                } catch (IOException invalidLocalPatch) {
-                    System.err.println("[mod-updater] Installed org.lwjgl.json is invalid: "
-                            + invalidLocalPatch.getMessage());
-                }
+        boolean localPatchValid = false;
+        if (state.patchFile != null && Files.isRegularFile(state.patchFile)) {
+            try {
+                state.currentVersion = validateLwjgl3Patch(state.patchFile);
+                localPatchValid = true;
+            } catch (IOException invalidLocalPatch) {
+                System.err.println("[mod-updater] Installed org.lwjgl.json is invalid: "
+                        + invalidLocalPatch.getMessage());
             }
+        }
 
-            InstalledMarker marker = localPatchValid ? readMarker(state.patchFile) : null;
-            boolean releaseMatches = marker != null
-                    && equalsSafe(marker.tag, latest.tag)
-                    && equalsSafe(marker.assetName, asset.name);
-            state.updateAvailable = !localPatchValid || !releaseMatches;
-            if (state.updateAvailable) {
-                System.out.println("[mod-updater] LWJGL3 component patch update available"
-                        + (state.currentVersion != null ? " (installed " + state.currentVersion + ")" : "")
-                        + (latest.tag != null ? ": release " + latest.tag : "."));
-            }
-        } catch (Throwable t) {
-            // This auxiliary update source must not prevent the game updater from
-            // opening when GitHub is temporarily unavailable.
-            System.err.println("[mod-updater] LWJGL3 patch update check failed: " + t.getMessage());
+        InstalledMarker marker = localPatchValid ? readMarker(state.patchFile) : null;
+        boolean releaseMatches = marker != null
+                && equalsSafe(marker.tag, latest.tag)
+                && equalsSafe(marker.assetName, asset.name);
+        state.updateAvailable = !localPatchValid || !releaseMatches;
+        if (state.updateAvailable) {
+            System.out.println("[mod-updater] LWJGL3 component patch update available"
+                    + (state.currentVersion != null ? " (installed " + state.currentVersion + ")" : "")
+                    + (latest.tag != null ? ": release " + latest.tag : "."));
         }
         return state;
     }
@@ -2377,12 +2396,26 @@ public final class ModUpdaterGUI {
     }
 
     private static void showLibrariesUpdatedDialog(final Component parent) throws Exception {
+        showBlockingInformationDialog(
+                parent,
+                "Libraries have been updated. Please restart Prism Launcher.",
+                "Libraries updated");
+    }
+
+    private static void showLwjglRefetchCompleteDialog(final Component parent) throws Exception {
+        showBlockingInformationDialog(parent, LWJGL_RESTART_MESSAGE, "LWJGL JSON re-fetched");
+    }
+
+    private static void showBlockingInformationDialog(
+            final Component parent,
+            final String message,
+            final String title) throws Exception {
         Runnable showDialog = new Runnable() {
             public void run() {
                 JOptionPane.showMessageDialog(
                         parent,
-                        "Libraries have been updated. Please restart Prism Launcher.",
-                        "Libraries updated",
+                        message,
+                        title,
                         JOptionPane.INFORMATION_MESSAGE);
             }
         };
@@ -2570,6 +2603,7 @@ public final class ModUpdaterGUI {
         
         c.gridx = 1;
         final JButton fetchResourcesButton = new JButton("Fetch Resources");
+        final JButton refetchLwjglButton = new JButton("Re-fetch LWJGL JSON");
         fetchResourcesButton.addActionListener(new AbstractAction() {
             public void actionPerformed(ActionEvent e) {
                 if (finalMinecraftDir == null) {
@@ -2596,6 +2630,7 @@ public final class ModUpdaterGUI {
                 
                 fetchResourcesButton.setEnabled(false);
                 fetchResourcesButton.setText("Fetching...");
+                refetchLwjglButton.setEnabled(false);
                 
                 Thread worker = new Thread(new Runnable() {
                     public void run() {
@@ -2620,6 +2655,7 @@ public final class ModUpdaterGUI {
                                 public void run() {
                                     fetchResourcesButton.setEnabled(true);
                                     fetchResourcesButton.setText("Fetch Resources");
+                                    refetchLwjglButton.setEnabled(true);
                                     JOptionPane.showMessageDialog(
                                             dialog,
                                             "Resources were fully re-downloaded from " + resourceSource
@@ -2633,6 +2669,7 @@ public final class ModUpdaterGUI {
                                 public void run() {
                                     fetchResourcesButton.setEnabled(true);
                                     fetchResourcesButton.setText("Fetch Resources");
+                                    refetchLwjglButton.setEnabled(true);
                                     showError(ex);
                                 }
                             });
@@ -2644,6 +2681,18 @@ public final class ModUpdaterGUI {
             }
         });
         center.add(fetchResourcesButton, c);
+
+        // LWJGL JSON row - force a fresh release lookup and verified replacement.
+        c.gridx = 0;
+        c.gridy = 5;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
+        c.insets = new Insets(6, 0, 4, 8);
+        JLabel refetchLwjglLabel = new JLabel("LWJGL JSON:");
+        center.add(refetchLwjglLabel, c);
+
+        c.gridx = 1;
+        center.add(refetchLwjglButton, c);
 
         root.add(center, BorderLayout.CENTER);
 
@@ -2657,12 +2706,81 @@ public final class ModUpdaterGUI {
         betaCheck.setEnabled(launcherState != null && launcherState.betaRepo != null && !launcherState.betaRepo.isEmpty());
         bottom.add(betaCheck, BorderLayout.WEST);
         JPanel bottomButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-        JButton done = new JButton("Done");
+        final JButton done = new JButton("Done");
         bottomButtons.add(done);
         bottom.add(bottomButtons, BorderLayout.EAST);
         root.add(bottom, BorderLayout.SOUTH);
 
         // Wire up actions
+        refetchLwjglButton.addActionListener(new AbstractAction() {
+            public void actionPerformed(ActionEvent e) {
+                if (launcherState == null || finalInstanceRoot == null) {
+                    JOptionPane.showMessageDialog(
+                            dialog,
+                            "The Prism instance directory is unavailable, so the LWJGL JSON cannot be re-fetched.",
+                            "Re-fetch LWJGL JSON",
+                            JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+
+                refetchLwjglButton.setEnabled(false);
+                refetchLwjglButton.setText("Re-fetching...");
+                fetchResourcesButton.setEnabled(false);
+                done.setEnabled(false);
+                dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+
+                Thread worker = new Thread(new Runnable() {
+                    public void run() {
+                        try {
+                            ProgressUI progress = new ProgressUI() {
+                                public void progress(int pct) {
+                                    // The manual action keeps a stable button label while downloading.
+                                }
+                                public void setPhaseText(String text) {
+                                    if (text != null) System.out.println("[mod-updater] " + text);
+                                }
+                                public void log(String text) {
+                                    if (text != null) System.out.println("[mod-updater] " + text);
+                                }
+                            };
+                            Lwjgl3PatchUpdateState refreshed = refetchLwjgl3PatchUpdate(
+                                    progress,
+                                    launcherState.lwjgl3Repo,
+                                    launcherState.lwjgl3AssetRegex,
+                                    finalInstanceRoot);
+                            launcherState.lwjgl3PatchUpdate = refreshed;
+                            launcherState.hasUpdate = launcherState.branch != null
+                                    && !launcherState.branch.upToDate;
+                            System.out.println("[mod-updater] LWJGL JSON was manually re-fetched. "
+                                    + "Prism loaded the old metadata before the pre-launch command, so this launch is being cancelled.");
+                            try {
+                                showLwjglRefetchCompleteDialog(dialog);
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                System.err.println("[mod-updater] LWJGL JSON was re-fetched, but the restart notice was interrupted.");
+                            } catch (Exception dialogFailure) {
+                                System.err.println("[mod-updater] LWJGL JSON was re-fetched, but the restart notice could not be shown: "
+                                        + dialogFailure.getMessage());
+                            }
+                            System.exit(PRE_LAUNCH_CANCELLED_EXIT_CODE);
+                        } catch (final Throwable ex) {
+                            SwingUtilities.invokeLater(new Runnable() {
+                                public void run() {
+                                    refetchLwjglButton.setEnabled(true);
+                                    refetchLwjglButton.setText("Re-fetch LWJGL JSON");
+                                    fetchResourcesButton.setEnabled(true);
+                                    done.setEnabled(true);
+                                    dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+                                    showError(ex);
+                                }
+                            });
+                        }
+                    }
+                }, "ModUpdater-RefetchLwjglJson");
+                worker.setDaemon(false);
+                worker.start();
+            }
+        });
         done.addActionListener(new AbstractAction() {
             public void actionPerformed(ActionEvent e) {
                 dialog.dispose();
@@ -2976,13 +3094,44 @@ public final class ModUpdaterGUI {
     }
 
     /**
-     * Installs a separately released Prism component patch at
-     * instanceRoot/patches/org.lwjgl.json.
-     *
-     * @return true when the component file was replaced. Prism loads component
-     *         metadata before running its pre-launch command, so callers must
-     *         cancel this launch and let the next launch reload the new file.
+     * Resolves the latest configured LWJGL JSON release again and forces it
+     * through the verified staging/install pipeline, even when its marker matches.
      */
+    private static Lwjgl3PatchUpdateState refetchLwjgl3PatchUpdate(
+            ProgressUI ui,
+            String repo,
+            String assetRegex,
+            Path instanceRoot) throws Exception {
+        if (instanceRoot == null) {
+            throw new IllegalArgumentException("LWJGL JSON re-fetch requires an instance root; pass --instanceDir.");
+        }
+        if (repo == null || repo.trim().length() == 0) {
+            throw new IllegalArgumentException("LWJGL JSON re-fetch requires lwjgl3Repo to be configured.");
+        }
+        if (assetRegex == null || assetRegex.trim().length() == 0) {
+            throw new IllegalArgumentException("LWJGL JSON re-fetch requires lwjgl3AssetRegex to be configured.");
+        }
+
+        Lwjgl3PatchUpdateState refreshed = fetchLwjgl3PatchUpdateState(repo, assetRegex, instanceRoot);
+        if (refreshed.latest == null || refreshed.asset == null) {
+            throw new IOException("No LWJGL JSON release asset matched '" + assetRegex
+                    + "' in " + repo + ".");
+        }
+
+        PreparedLwjgl3Patch prepared = null;
+        try {
+            prepared = prepareLwjgl3PatchUpdate(ui, refreshed, instanceRoot, true);
+            if (prepared == null || !installLwjgl3PatchUpdate(ui, prepared)) {
+                throw new IOException("The LWJGL JSON release asset could not be prepared for installation.");
+            }
+            prepared = null;
+            return refreshed;
+        } finally {
+            discardPreparedLwjgl3Patch(prepared);
+        }
+    }
+
+    /** Downloads, validates, and stages a separately released Prism component patch. */
     private static PreparedLwjgl3Patch prepareLwjgl3PatchUpdate(
             ProgressUI ui,
             Lwjgl3PatchUpdateState update,
